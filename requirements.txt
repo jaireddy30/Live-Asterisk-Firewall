@@ -1,0 +1,3 @@
+pip show watchdog
+pip show colorama
+pip show pandas
