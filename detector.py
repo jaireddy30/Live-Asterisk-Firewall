@@ -15,12 +15,25 @@ Author:
 
 from config import *
 
+# Fallback threshold in case it's not defined in config.py yet.
+try:
+    TOLL_FRAUD_THRESHOLD
+except NameError:
+    TOLL_FRAUD_THRESHOLD = 2
+
 
 class Detector:
 
     def __init__(self):
 
         self.attack_db = {}
+
+        # Separate tracking for toll fraud, keyed by DESTINATION
+        # NUMBER instead of source IP. Real toll-fraud log lines
+        # (e.g. "Local/919566704154__...") carry no source IP at
+        # all - the fraud is in what number your own PBX is
+        # calling out to, not who connected in.
+        self.toll_db = {}
 
     # ---------------------------------------------------
     # Initialize IP
@@ -37,12 +50,26 @@ class Detector:
                 "invite": 0,
                 "options": 0,
                 "unknown_endpoint": 0,
-                "toll_fraud": 0,
 
                 "auth_challenge": 0,
                 "auth_success": 0,
                 "acl_blocked": 0,
                 "request_blocked": 0
+
+            }
+
+    # ---------------------------------------------------
+    # Initialize Destination (for toll fraud tracking)
+    # ---------------------------------------------------
+
+    def initialize_destination(self, destination):
+
+        if destination not in self.toll_db:
+
+            self.toll_db[destination] = {
+
+                "count": 0,
+                "account_ids_seen": set()
 
             }
 
@@ -70,11 +97,9 @@ class Detector:
         # -----------------------------------------------
         # Successful Auth
         #
-        # If this IP successfully authenticates, it is
-        # unlikely to be the source of a brute-force attempt
-        # right now. Reset the failed_auth counter so a
-        # legitimate user who mistyped a password a few times
-        # isn't blocked right after they log in correctly.
+        # Reset failed_auth so a legitimate user who mistyped
+        # a password a couple times isn't blocked right after
+        # they log in correctly.
         # -----------------------------------------------
 
         elif event["event"] == "AUTH_SUCCESS":
@@ -96,7 +121,7 @@ class Detector:
                 severity = "HIGH"
 
         # -----------------------------------------------
-        # ACL Blocked (Asterisk already rejected this at ACL level)
+        # ACL Blocked
         # -----------------------------------------------
 
         elif event["event"] == "ACL_BLOCKED":
@@ -119,14 +144,31 @@ class Detector:
 
         # -----------------------------------------------
         # Toll Fraud
+        #
+        # Tracked by DESTINATION NUMBER, not source IP, since
+        # the source IP is usually "UNKNOWN" for this event type
+        # (it's your own PBX placing an outbound call). Also
+        # records which account_id(s) were associated with calls
+        # to this number, when available, to help manual
+        # investigation (e.g. cross-checking CDR).
         # -----------------------------------------------
 
         elif event["event"] == "TOLL_FRAUD":
 
-            self.attack_db[ip]["toll_fraud"] += 1
+            destination = event.get("destination") or "UNKNOWN_DESTINATION"
 
-            attack = "TOLL_FRAUD"
-            severity = "CRITICAL"
+            self.initialize_destination(destination)
+
+            self.toll_db[destination]["count"] += 1
+
+            account_id = event.get("account_id", "UNKNOWN")
+            if account_id != "UNKNOWN":
+                self.toll_db[destination]["account_ids_seen"].add(account_id)
+
+            if self.toll_db[destination]["count"] >= TOLL_FRAUD_THRESHOLD:
+
+                attack = "TOLL_FRAUD"
+                severity = "CRITICAL"
 
         # -----------------------------------------------
         # Unknown Endpoint
@@ -184,6 +226,35 @@ class Detector:
 
         if attack:
 
+            if attack == "TOLL_FRAUD":
+
+                destination = event.get("destination") or "UNKNOWN_DESTINATION"
+
+                result = {
+
+                    "source_ip": ip,
+
+                    "attack": attack,
+
+                    "severity": severity,
+
+                    "destination": destination,
+
+                    "details": self.toll_db[destination]
+
+                }
+
+                print("\n====================================")
+                print("ATTACK DETECTED")
+                print("====================================")
+                print("Attack       :", attack)
+                print("Severity     :", severity)
+                print("Destination  :", destination)
+                print("Call Count   :", self.toll_db[destination]["count"])
+                print("Account IDs  :", self.toll_db[destination]["account_ids_seen"] or "Not available in log - check CDR")
+
+                return result
+
             result = {
 
                 "source_ip": ip,
@@ -240,10 +311,8 @@ if __name__ == "__main__":
         if attack:
 
             print("\nFinal Result")
-
             print(attack)
 
-    # Verify AUTH_SUCCESS resets the failed_auth counter
     success_sample = {
 
         "source_ip": "185.22.11.5",
@@ -258,3 +327,30 @@ if __name__ == "__main__":
 
     print("\nAfter AUTH_SUCCESS, failed_auth counter:")
     print(detector.attack_db["185.22.11.5"]["failed_auth"])
+
+    # Simulate the real toll-fraud pattern you saw in production:
+    # two outbound calls to the same international number within
+    # a short window, no source IP available.
+    toll_sample = {
+
+        "source_ip": "UNKNOWN",
+
+        "event": "TOLL_FRAUD",
+
+        "method": "UNKNOWN",
+
+        "destination": "919566704154",
+
+        "account_id": "UNKNOWN"
+
+    }
+
+    print("\n--- Simulating repeated toll fraud calls ---")
+
+    for _ in range(2):
+
+        result = detector.detect(toll_sample)
+
+        if result:
+            print("\nFinal Toll Fraud Result:")
+            print(result)
