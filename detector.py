@@ -30,16 +30,21 @@ class Detector:
 
         if ip not in self.attack_db:
 
-            self.attack_db[ip] = {
+           self.attack_db[ip] = {
 
-                "failed_auth": 0,
-                "register": 0,
-                "invite": 0,
-                "options": 0,
-                "unknown_endpoint": 0,
-                "toll_fraud": 0
+    "failed_auth": 0,
+    "register": 0,
+    "invite": 0,
+    "options": 0,
+    "unknown_endpoint": 0,
+    "toll_fraud": 0,
 
-            }
+    "auth_challenge": 0,
+    "auth_success": 0,
+    "acl_blocked": 0,
+    "request_blocked": 0
+
+}
 
     # ---------------------------------------------------
     # Main Detection Function
