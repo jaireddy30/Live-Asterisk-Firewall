@@ -50,6 +50,7 @@ class LogParser:
         timestamp = match.group(1).strip()
 
         formats = [
+            "%Y-%m-%d %H:%M:%S.%f",
             "%b %d %H:%M:%S",
             "%Y-%m-%d %H:%M:%S",
             "%b %d %Y %H:%M:%S",
@@ -78,14 +79,10 @@ class LogParser:
     # Strategy:
     #   1. Try high-confidence, structured patterns first
     #      (SecurityEvent RemoteAddress, "from", "received from").
-    #   2. If one of those matches, use it directly - these are
-    #      almost always the real attacker/peer IP.
-    #   3. If nothing structured matches, fall back to scanning
-    #      every IP-looking token in the line and prefer the
-    #      first PUBLIC IP over a private/local one. This avoids
-    #      accidentally picking your own LAN extension's IP out
-    #      of a Via: or Contact: header instead of the real
-    #      remote address.
+    #   2. If nothing structured matches, fall back to scanning
+    #      every IP-looking token and prefer a PUBLIC one over a
+    #      private/local one (avoids grabbing your own LAN IP out
+    #      of a Via: or Contact: header).
     # --------------------------------------------------
 
     def extract_ip(self, line):
@@ -104,7 +101,6 @@ class LogParser:
             if match:
                 return match.group(1)
 
-        # Fallback: scan every IP-looking token, prefer a public one
         all_ips = re.findall(r"\d+\.\d+\.\d+\.\d+", line)
 
         if not all_ips:
@@ -114,8 +110,64 @@ class LogParser:
             if not is_private_ip(ip):
                 return ip
 
-        # Nothing public found - return the first match anyway
         return all_ips[0]
+
+    # --------------------------------------------------
+    # Extract Account / Extension ID
+    #
+    # Present on Asterisk SecurityEvent lines, e.g.
+    # AccountID="2002". Not present on every line - callers
+    # should treat "UNKNOWN" as "not available in this line".
+    # --------------------------------------------------
+
+    def extract_account_id(self, line):
+
+        match = re.search(r'AccountID="([^"]+)"', line)
+
+        if match:
+            return match.group(1)
+
+        return "UNKNOWN"
+
+    # --------------------------------------------------
+    # Extract Toll-Fraud Destination Number
+    #
+    # Two real patterns seen in production Asterisk logs:
+    #
+    #   1. Dial(SIP/trunk/00441234567890) or ...+971...
+    #   2. Local/919566704154__<call-id>...
+    #      (seen in core_local.c "without a @context" warnings)
+    #
+    # Returns the destination number as a string, or None.
+    # --------------------------------------------------
+
+    def extract_toll_destination(self, line):
+
+        # Pattern 1: Dial() with international prefix
+        dial_match = re.search(
+            r"DIAL\([^)]*(?:\+|00)(\d{9,15})",
+            line.upper()
+        )
+
+        if dial_match:
+            return dial_match.group(1)
+
+        # Pattern 2: Local/<number>__<call-id>
+        local_match = re.search(
+            r"Local/(\d{9,15})__",
+            line
+        )
+
+        if local_match:
+            return local_match.group(1)
+
+        # Pattern 3: bare "TOLL" keyword mention with a nearby number
+        if "TOLL" in line.upper():
+            bare_number = re.search(r"(\d{9,15})", line)
+            if bare_number:
+                return bare_number.group(1)
+
+        return None
 
     # --------------------------------------------------
     # Detect Module
@@ -127,6 +179,9 @@ class LogParser:
 
         if "FUNC_ODBC.C" in upper:
             return "func_odbc.c"
+
+        elif "CORE_LOCAL.C" in upper:
+            return "core_local.c"
 
         elif "CHANNEL.C" in upper:
             return "channel.c"
@@ -184,36 +239,6 @@ class LogParser:
         return "UNKNOWN"
 
     # --------------------------------------------------
-    # Detect possible toll-fraud indicators in a log line
-    #
-    # NOTE: True toll-fraud detection needs CDR data (call
-    # duration, destination, cost) - a single log line rarely
-    # contains enough info. This checks for common signs that
-    # DO sometimes appear in Asterisk dial logs: outbound calls
-    # to international prefixes or explicit "toll" mentions.
-    # Treat this as a weak signal, not a reliable detector.
-    # --------------------------------------------------
-
-    def looks_like_toll_fraud(self, line):
-
-        upper = line.upper()
-
-        if "TOLL" in upper:
-            return True
-
-        # Common international dial prefixes seen in Dial() lines,
-        # e.g. Dial(SIP/trunk/00441234567890) or .../+971...
-        international_patterns = [
-            r"DIAL\([^)]*(\+|00)(44|971|1|234|91)\d{6,}",
-        ]
-
-        for pattern in international_patterns:
-            if re.search(pattern, upper):
-                return True
-
-        return False
-
-    # --------------------------------------------------
     # Classify Event
     # --------------------------------------------------
 
@@ -255,7 +280,7 @@ class LogParser:
         elif "SUCCESSFULLY REGISTERED" in upper:
             return "REGISTER_SUCCESS"
 
-        elif self.looks_like_toll_fraud(line):
+        elif self.extract_toll_destination(line) is not None:
             return "TOLL_FRAUD"
 
         elif "REGISTER" in upper:
@@ -301,6 +326,10 @@ class LogParser:
 
             "source_ip": self.extract_ip(line),
 
+            "account_id": self.extract_account_id(line),
+
+            "destination": self.extract_toll_destination(line),
+
             "module": self.detect_module(line),
 
             "method": self.detect_method(line),
@@ -326,19 +355,13 @@ if __name__ == "__main__":
 
         '[Jul 22 10:10:20] NOTICE Received SIP INVITE from 192.168.1.20',
 
-        '[Jul 22 10:10:25] WARNING res_pjsip: Request "OPTIONS" from 192.168.1.30 failed',
-
         '[Jul 22 10:10:30] SECURITY SecurityEvent="ChallengeSent" RemoteAddress="IPV4/UDP/192.168.1.192/57948"',
 
-        '[Jul 22 10:10:31] SECURITY SecurityEvent="SuccessfulAuth" RemoteAddress="IPV4/UDP/192.168.1.192/57948"',
+        '[Jul 24 09:53:41] SECURITY[1386] res_security_log.c: SecurityEvent="SuccessfulAuth",AccountID="2002",LocalAddress="IPV4/UDP/192.168.1.76/5060",RemoteAddress="IPV4/UDP/192.168.1.192/60941"',
 
-        '[Jul 22 10:10:32] SECURITY SecurityEvent="InvalidPassword" RemoteAddress="IPV4/UDP/185.22.11.5/5060"',
-
-        '[Jul 22 10:10:33] SECURITY SecurityEvent="InvalidAccountID" RemoteAddress="IPV4/UDP/185.22.11.5/5060"',
+        '[2026-07-24 15:40:38.311] WARNING[1643562] core_local.c: Someone used Local/919566704154__7e36d5ab-7958-43ac-b89e-b3889244b808__8d18d75e-0dac-4e97 somewhere without a @context. This is bad.',
 
         '[Jul 22 10:10:34] NOTICE Dial(SIP/trunk-out/00441234567890) from ext 1001',
-
-        '[Jul 22 10:10:35] NOTICE INVITE via Via: SIP/2.0/UDP 192.168.1.5;received=203.0.113.9'
 
     ]
 
