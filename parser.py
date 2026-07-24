@@ -42,7 +42,9 @@ class LogParser:
         ]
 
         for fmt in formats:
+
             try:
+
                 parsed = datetime.strptime(timestamp, fmt)
 
                 if fmt == "%b %d %H:%M:%S":
@@ -63,15 +65,19 @@ class LogParser:
 
         patterns = [
 
-            r"(\d{1,3}(?:\.\d{1,3}){3})",
+            r'RemoteAddress="IPV4/UDP/(\d+\.\d+\.\d+\.\d+)',
 
-            r"from\s+'?(\d{1,3}(?:\.\d{1,3}){3})",
+            r'LocalAddress="IPV4/UDP/(\d+\.\d+\.\d+\.\d+)',
 
-            r"received\s+from\s+(\d{1,3}(?:\.\d{1,3}){3})",
+            r"from\s+'?(\d+\.\d+\.\d+\.\d+)",
 
-            r"Contact:.*?@(\d{1,3}(?:\.\d{1,3}){3})",
+            r"received\s+from\s+(\d+\.\d+\.\d+\.\d+)",
 
-            r"Via:.*?(\d{1,3}(?:\.\d{1,3}){3})"
+            r"Contact:.*?@(\d+\.\d+\.\d+\.\d+)",
+
+            r"Via:.*?(\d+\.\d+\.\d+\.\d+)",
+
+            r"(\d+\.\d+\.\d+\.\d+)"
 
         ]
 
@@ -100,6 +106,9 @@ class LogParser:
 
         elif "RES_PJSIP" in upper:
             return "res_pjsip"
+
+        elif "RES_SECURITY_LOG.C" in upper:
+            return "res_security_log.c"
 
         elif "CHAN_SIP" in upper:
             return "chan_sip"
@@ -142,7 +151,7 @@ class LogParser:
 
         for method in methods:
 
-            if method in upper:
+            if re.search(r"\b" + method + r"\b", upper):
                 return method
 
         return "UNKNOWN"
@@ -155,9 +164,29 @@ class LogParser:
 
         upper = line.upper()
 
-        # ---------- Security Events ----------
+        # ---------- Asterisk Security Events ----------
 
-        if "FAILED AUTHENTICATION" in upper:
+        if 'SECURITYEVENT="CHALLENGESENT"' in upper:
+            return "AUTH_CHALLENGE"
+
+        elif 'SECURITYEVENT="SUCCESSFULAUTH"' in upper:
+            return "AUTH_SUCCESS"
+
+        elif 'SECURITYEVENT="INVALIDPASSWORD"' in upper:
+            return "FAILED_AUTH"
+
+        elif 'SECURITYEVENT="INVALIDACCOUNTID"' in upper:
+            return "UNKNOWN_ENDPOINT"
+
+        elif 'SECURITYEVENT="FAILEDACL"' in upper:
+            return "ACL_BLOCKED"
+
+        elif 'SECURITYEVENT="REQUESTNOTALLOWED"' in upper:
+            return "REQUEST_BLOCKED"
+
+        # ---------- Generic Events ----------
+
+        elif "FAILED AUTHENTICATION" in upper:
             return "FAILED_AUTH"
 
         elif "WRONG PASSWORD" in upper:
@@ -209,7 +238,7 @@ class LogParser:
 
     def parse(self, line):
 
-        event = {
+        return {
 
             "timestamp": self.extract_timestamp(line),
 
@@ -225,8 +254,6 @@ class LogParser:
 
         }
 
-        return event
-
 
 # ------------------------------------------------------
 # Testing
@@ -238,13 +265,19 @@ if __name__ == "__main__":
 
     samples = [
 
-        "[Jul 22 10:10:15] NOTICE Failed Authentication from '185.22.11.5' using REGISTER",
+        '[Jul 22 10:10:15] NOTICE Failed Authentication from "185.22.11.5" using REGISTER',
 
-        "[Jul 22 10:10:20] NOTICE Received SIP INVITE from 192.168.1.20",
+        '[Jul 22 10:10:20] NOTICE Received SIP INVITE from 192.168.1.20',
 
-        "[Jul 22 10:10:25] WARNING[1234] res_pjsip/pjsip_distributor.c: Request 'OPTIONS' from '192.168.1.30' failed",
+        '[Jul 22 10:10:25] WARNING res_pjsip: Request "OPTIONS" from 192.168.1.30 failed',
 
-        "[Jul 22 10:10:30] WARNING[1234] channel.c: Exceptionally long voice queue length"
+        '[Jul 22 10:10:30] SECURITY SecurityEvent="ChallengeSent" RemoteAddress="IPV4/UDP/192.168.1.192/57948"',
+
+        '[Jul 22 10:10:31] SECURITY SecurityEvent="SuccessfulAuth" RemoteAddress="IPV4/UDP/192.168.1.192/57948"',
+
+        '[Jul 22 10:10:32] SECURITY SecurityEvent="InvalidPassword" RemoteAddress="IPV4/UDP/185.22.11.5/5060"',
+
+        '[Jul 22 10:10:33] SECURITY SecurityEvent="InvalidAccountID" RemoteAddress="IPV4/UDP/185.22.11.5/5060"'
 
     ]
 
