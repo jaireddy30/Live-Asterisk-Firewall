@@ -28,9 +28,6 @@ from firewall import Firewall
 init(autoreset=True)
 
 
-# Event types that are recognized but are NOT attacks. Reason
-# text is static for auth-related events, and built dynamically
-# (using the module field) for internal system log events.
 STATIC_NON_ATTACK_REASONS = {
 
     "AUTH_CHALLENGE": "Authentication challenge sent (normal SIP handshake)",
@@ -39,9 +36,6 @@ STATIC_NON_ATTACK_REASONS = {
 
 }
 
-# These event types get a reason built from parsed_event['module']
-# instead of a fixed string, since they can come from several
-# different modules (pbx.c, app_dial.c, bridge_channel.c, etc.)
 DYNAMIC_MODULE_EVENTS = {
     "SYSTEM_LOG",
     "DATABASE_LOG",
@@ -49,6 +43,14 @@ DYNAMIC_MODULE_EVENTS = {
     "CHAN_SIP_LOG",
     "RTP_LOG",
 }
+
+# Marker that starts a multi-line raw SIP message dump, e.g.:
+#   VERBOSE[20588] res_pjsip_logger.c: <--- Transmitting SIP response (521 bytes) to UDP:192.168.1.15:55714 --->
+# Everything until the next blank line belongs to THIS message
+# and must be parsed together, not line-by-line - otherwise the
+# IP (in Via:/Contact:) and the method (in the request line or
+# CSeq:) end up split across separate, uncorrelated events.
+SIP_BLOCK_MARKER = "<---"
 
 
 class LogMonitor(FileSystemEventHandler):
@@ -66,6 +68,121 @@ class LogMonitor(FileSystemEventHandler):
         self.detector = Detector()
         self.firewall = Firewall()
 
+        # Buffering state for multi-line SIP message blocks
+        self._in_sip_block = False
+        self._sip_block_lines = []
+
+    # -----------------------------------------------------
+    # Process one fully-assembled "line" (either a normal
+    # single log line, or a joined multi-line SIP block)
+    # -----------------------------------------------------
+
+    def process_entry(self, text):
+
+        print(Fore.GREEN + "\n============================================================")
+        print(Fore.GREEN + "LIVE LOG")
+        print(Fore.GREEN + "============================================================")
+        print(text.strip())
+
+        parsed_event = self.parser.parse(text)
+
+        print(Fore.CYAN + "\n============================================================")
+        print(Fore.CYAN + "PARSER ANALYSIS")
+        print(Fore.CYAN + "============================================================")
+
+        print(Fore.GREEN + f"🕒 Timestamp        : {parsed_event['timestamp']}")
+
+        if parsed_event["source_ip"] != "UNKNOWN":
+            print(Fore.GREEN + f"✅ Source IP        : {parsed_event['source_ip']}")
+        else:
+            print(Fore.RED + "❌ Source IP        : Not Found")
+
+        if parsed_event["method"] != "UNKNOWN":
+            print(Fore.GREEN + f"✅ SIP Method       : {parsed_event['method']}")
+        else:
+            print(Fore.RED + "❌ SIP Method       : Not Found")
+
+        if parsed_event["event"] != "OTHER":
+            print(Fore.GREEN + f"✅ Event Type       : {parsed_event['event']}")
+        else:
+            print(Fore.RED + "❌ Event Type       : Unknown")
+
+        if parsed_event["event"] == "FAILED_AUTH":
+            print(Fore.GREEN + "✅ Authentication   : Failed")
+        elif parsed_event["event"] == "AUTH_SUCCESS":
+            print(Fore.GREEN + "✅ Authentication   : Success")
+        else:
+            print(Fore.RED + "❌ Authentication   : Not Found")
+
+        if parsed_event["method"] == "REGISTER":
+            print(Fore.GREEN + "✅ REGISTER         : Detected")
+        else:
+            print(Fore.RED + "❌ REGISTER         : Not Found")
+
+        if parsed_event["method"] == "INVITE":
+            print(Fore.GREEN + "✅ INVITE           : Detected")
+        else:
+            print(Fore.RED + "❌ INVITE           : Not Found")
+
+        if parsed_event["method"] == "OPTIONS":
+            print(Fore.GREEN + "✅ OPTIONS          : Detected")
+        else:
+            print(Fore.RED + "❌ OPTIONS          : Not Found")
+
+        if parsed_event["module"] != "UNKNOWN":
+            print(Fore.YELLOW + f"ℹ️ Module           : {parsed_event['module']}")
+
+        print(Fore.CYAN + "============================================================")
+
+        attack = self.detector.detect(parsed_event)
+
+        if attack:
+
+            self.firewall.process_attack(attack)
+
+        else:
+
+            print(Fore.YELLOW + "\n============================================================")
+            print(Fore.YELLOW + "FIREWALL ANALYSIS")
+            print(Fore.YELLOW + "============================================================")
+
+            event_type = parsed_event["event"]
+            module = parsed_event["module"]
+
+            print(Fore.YELLOW + "Status          : Ignored")
+
+            if event_type in STATIC_NON_ATTACK_REASONS:
+
+                print(Fore.YELLOW + f"Reason          : {STATIC_NON_ATTACK_REASONS[event_type]}")
+                print(Fore.YELLOW + f"Event Type      : {event_type}")
+
+            elif event_type in DYNAMIC_MODULE_EVENTS:
+
+                print(Fore.YELLOW + "Reason          : Internal Asterisk log, not a security event")
+                print(Fore.YELLOW + f"Module          : {module}")
+                print(Fore.YELLOW + f"Event Type      : {event_type}")
+
+            elif event_type == "OTHER":
+
+                print(Fore.YELLOW + "Reason          : Unsupported or Unknown Log")
+                print(Fore.YELLOW + f"Module          : {module}")
+
+            else:
+
+                print(Fore.YELLOW + "Reason          : Recognized event, below attack threshold")
+                print(Fore.YELLOW + f"Event Type      : {event_type}")
+
+            print(Fore.YELLOW + "Threat Level    : None")
+            print(Fore.YELLOW + "Firewall Action : No Action")
+            print(Fore.YELLOW + "Monitoring      : Continue")
+
+            print(Fore.YELLOW + "============================================================")
+
+    # -----------------------------------------------------
+    # File watcher callback - reads raw lines and buffers
+    # multi-line SIP blocks before handing off to process_entry
+    # -----------------------------------------------------
+
     def on_modified(self, event):
 
         if event.src_path != ASTERISK_LOG:
@@ -78,118 +195,31 @@ class LogMonitor(FileSystemEventHandler):
             if not line:
                 break
 
-            print(Fore.GREEN + "\n============================================================")
-            print(Fore.GREEN + "LIVE LOG")
-            print(Fore.GREEN + "============================================================")
-            print(line.strip())
+            # Start of a new multi-line raw SIP message dump
+            if SIP_BLOCK_MARKER in line and (
+                "Transmitting SIP" in line or "Received SIP" in line
+            ):
+                self._in_sip_block = True
+                self._sip_block_lines = [line]
+                continue
 
-            # --------------------------------------------------
-            # Parse
-            # --------------------------------------------------
+            if self._in_sip_block:
 
-            parsed_event = self.parser.parse(line)
-
-            print(Fore.CYAN + "\n============================================================")
-            print(Fore.CYAN + "PARSER ANALYSIS")
-            print(Fore.CYAN + "============================================================")
-
-            print(Fore.GREEN + f"🕒 Timestamp        : {parsed_event['timestamp']}")
-
-            if parsed_event["source_ip"] != "UNKNOWN":
-                print(Fore.GREEN + f"✅ Source IP        : {parsed_event['source_ip']}")
-            else:
-                print(Fore.RED + "❌ Source IP        : Not Found")
-
-            if parsed_event["method"] != "UNKNOWN":
-                print(Fore.GREEN + f"✅ SIP Method       : {parsed_event['method']}")
-            else:
-                print(Fore.RED + "❌ SIP Method       : Not Found")
-
-            if parsed_event["event"] != "OTHER":
-                print(Fore.GREEN + f"✅ Event Type       : {parsed_event['event']}")
-            else:
-                print(Fore.RED + "❌ Event Type       : Unknown")
-
-            if parsed_event["event"] == "FAILED_AUTH":
-                print(Fore.GREEN + "✅ Authentication   : Failed")
-            elif parsed_event["event"] == "AUTH_SUCCESS":
-                print(Fore.GREEN + "✅ Authentication   : Success")
-            else:
-                print(Fore.RED + "❌ Authentication   : Not Found")
-
-            if parsed_event["method"] == "REGISTER":
-                print(Fore.GREEN + "✅ REGISTER         : Detected")
-            else:
-                print(Fore.RED + "❌ REGISTER         : Not Found")
-
-            if parsed_event["method"] == "INVITE":
-                print(Fore.GREEN + "✅ INVITE           : Detected")
-            else:
-                print(Fore.RED + "❌ INVITE           : Not Found")
-
-            if parsed_event["method"] == "OPTIONS":
-                print(Fore.GREEN + "✅ OPTIONS          : Detected")
-            else:
-                print(Fore.RED + "❌ OPTIONS          : Not Found")
-
-            # Module - use the parser's own detection instead of
-            # a separate, incomplete hardcoded check.
-            if parsed_event["module"] != "UNKNOWN":
-                print(Fore.YELLOW + f"ℹ️ Module           : {parsed_event['module']}")
-
-            print(Fore.CYAN + "============================================================")
-
-            # --------------------------------------------------
-            # Detection
-            # --------------------------------------------------
-
-            attack = self.detector.detect(parsed_event)
-
-            # --------------------------------------------------
-            # Firewall
-            # --------------------------------------------------
-
-            if attack:
-
-                self.firewall.process_attack(attack)
-
-            else:
-
-                print(Fore.YELLOW + "\n============================================================")
-                print(Fore.YELLOW + "FIREWALL ANALYSIS")
-                print(Fore.YELLOW + "============================================================")
-
-                event_type = parsed_event["event"]
-                module = parsed_event["module"]
-
-                print(Fore.YELLOW + "Status          : Ignored")
-
-                if event_type in STATIC_NON_ATTACK_REASONS:
-
-                    print(Fore.YELLOW + f"Reason          : {STATIC_NON_ATTACK_REASONS[event_type]}")
-                    print(Fore.YELLOW + f"Event Type      : {event_type}")
-
-                elif event_type in DYNAMIC_MODULE_EVENTS:
-
-                    print(Fore.YELLOW + f"Reason          : Internal Asterisk log, not a security event")
-                    print(Fore.YELLOW + f"Module          : {module}")
-                    print(Fore.YELLOW + f"Event Type      : {event_type}")
-
-                elif event_type == "OTHER":
-
-                    print(Fore.YELLOW + "Reason          : Unsupported or Unknown Log")
-                    print(Fore.YELLOW + f"Module          : {module}")
-
+                if line.strip() == "":
+                    # Blank line = end of this SIP message block.
+                    # Join everything and process it as ONE entry.
+                    full_block = "".join(self._sip_block_lines)
+                    self._in_sip_block = False
+                    self._sip_block_lines = []
+                    self.process_entry(full_block)
                 else:
+                    self._sip_block_lines.append(line)
 
-                    print(Fore.YELLOW + "Reason          : Recognized event, below attack threshold")
-                    print(Fore.YELLOW + f"Event Type      : {event_type}")
+                continue
 
-                print(Fore.YELLOW + "Threat Level    : None")
-                print(Fore.YELLOW + "Firewall Action : No Action")
-                print(Fore.YELLOW + "Monitoring      : Continue")
-
-                print(Fore.YELLOW + "============================================================")
+            # Normal single-line log entry (SecurityEvent, VERBOSE
+            # call-flow lines, etc.) - process immediately as before
+            self.process_entry(line)
 
 
 def main():
