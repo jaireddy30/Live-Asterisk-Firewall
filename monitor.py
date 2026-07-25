@@ -1,12 +1,8 @@
 """
 ====================================================
-
 LIVE ASTERISK FIREWALL
 
-MODULE 1
-
-MAIN ENTRY POINT
-
+MODULE 1 - MAIN ENTRY POINT
 ====================================================
 """
 
@@ -21,7 +17,9 @@ from colorama import init
 
 from config import ASTERISK_LOG
 
-from parser import LogParser
+# FIX: renamed from 'parser' to 'log_parser' to avoid collision
+# with Python's stdlib 'parser' module (removed in Python 3.12).
+from log_parser import LogParser
 from detector import Detector
 from firewall import Firewall
 
@@ -29,11 +27,9 @@ init(autoreset=True)
 
 
 STATIC_NON_ATTACK_REASONS = {
-
-    "AUTH_CHALLENGE": "Authentication challenge sent (normal SIP handshake)",
-    "AUTH_SUCCESS": "Successful authentication",
+    "AUTH_CHALLENGE":   "Authentication challenge sent (normal SIP handshake)",
+    "AUTH_SUCCESS":     "Successful authentication",
     "REGISTER_SUCCESS": "Successful registration",
-
 }
 
 DYNAMIC_MODULE_EVENTS = {
@@ -44,22 +40,9 @@ DYNAMIC_MODULE_EVENTS = {
     "RTP_LOG",
 }
 
-# Marker that starts a multi-line raw SIP message dump, e.g.:
-#   VERBOSE[20588] res_pjsip_logger.c: <--- Transmitting SIP response (521 bytes) to UDP:192.168.1.15:55714 --->
+# Marker that starts a multi-line raw SIP message dump.
 # Everything until the NEXT bracketed Asterisk log line belongs
-# to THIS message and must be parsed together, not line-by-line -
-# otherwise the IP (in Via:/Contact:) and the method (in the
-# request line or CSeq:) end up split across separate,
-# uncorrelated events.
-#
-# NOTE: we deliberately do NOT use a blank line as the block
-# terminator. SIP messages with a body (e.g. INVITE with SDP)
-# contain a blank line INSIDE the message, separating headers
-# from the SDP body - using blank lines as the terminator would
-# cut the block short and dump the SDP body as garbage separate
-# entries. Every genuine new Asterisk log statement starts with
-# "[timestamp]" - SIP header/body lines never do - so that is
-# a much more reliable boundary.
+# to THIS message and must be parsed together, not line-by-line.
 SIP_BLOCK_MARKER = "<---"
 
 
@@ -79,11 +62,7 @@ class LogMonitor(FileSystemEventHandler):
 
     def __init__(self):
 
-        self.file = open(
-            ASTERISK_LOG,
-            "r"
-        )
-
+        self.file = open(ASTERISK_LOG, "r")
         self.file.seek(0, os.SEEK_END)
 
         self.parser = LogParser()
@@ -174,131 +153,26 @@ class LogMonitor(FileSystemEventHandler):
             print(Fore.YELLOW + "Status          : Ignored")
 
             if event_type in STATIC_NON_ATTACK_REASONS:
-
                 print(Fore.YELLOW + f"Reason          : {STATIC_NON_ATTACK_REASONS[event_type]}")
                 print(Fore.YELLOW + f"Event Type      : {event_type}")
 
             elif event_type in DYNAMIC_MODULE_EVENTS:
-
                 print(Fore.YELLOW + "Reason          : Internal Asterisk log, not a security event")
                 print(Fore.YELLOW + f"Module          : {module}")
                 print(Fore.YELLOW + f"Event Type      : {event_type}")
 
             elif event_type == "OTHER":
-
                 print(Fore.YELLOW + "Reason          : Unsupported or Unknown Log")
                 print(Fore.YELLOW + f"Module          : {module}")
 
             else:
-
                 print(Fore.YELLOW + "Reason          : Recognized event, below attack threshold")
                 print(Fore.YELLOW + f"Event Type      : {event_type}")
 
             print(Fore.YELLOW + "Threat Level    : None")
             print(Fore.YELLOW + "Firewall Action : No Action")
             print(Fore.YELLOW + "Monitoring      : Continue")
-
             print(Fore.YELLOW + "============================================================")
 
     # -----------------------------------------------------
-    # File watcher callback - reads raw lines and buffers
-    # multi-line SIP blocks before handing off to process_entry
-    # -----------------------------------------------------
-
-    def on_modified(self, event):
-
-        if event.src_path != ASTERISK_LOG:
-            return
-
-        while True:
-
-            line = self.file.readline()
-
-            if not line:
-                break
-
-            is_marker_line = SIP_BLOCK_MARKER in line and (
-                "Transmitting SIP" in line or "Received SIP" in line
-            )
-
-            if self._in_sip_block:
-
-                # A brand new bracketed log entry means the PREVIOUS
-                # SIP block has ended (regardless of blank lines in
-                # its body). Flush it now.
-                if is_new_log_entry(line):
-
-                    full_block = "".join(self._sip_block_lines)
-                    self._in_sip_block = False
-                    self._sip_block_lines = []
-                    self.process_entry(full_block)
-
-                    # This new line might itself start another SIP
-                    # block, or just be a normal single log line -
-                    # fall through to handle it below.
-
-                else:
-                    # Still inside the previous SIP message (this
-                    # covers blank lines inside an SDP body too)
-                    self._sip_block_lines.append(line)
-                    continue
-
-            # Start of a new multi-line raw SIP message dump
-            if is_marker_line:
-                self._in_sip_block = True
-                self._sip_block_lines = [line]
-                continue
-
-            # Skip standalone blank lines between unrelated log
-            # entries - they carry no information and would
-            # otherwise be parsed as a meaningless empty event.
-            if not line.strip():
-                continue
-
-            # Normal single-line log entry (SecurityEvent, VERBOSE
-            # call-flow lines, etc.) - process immediately
-            self.process_entry(line)
-
-
-def main():
-
-    print("=" * 60)
-    print("LIVE ASTERISK FIREWALL")
-    print("=" * 60)
-
-    print()
-    print("Watching")
-    print(ASTERISK_LOG)
-    print()
-
-    observer = Observer()
-
-    observer.schedule(
-
-        LogMonitor(),
-
-        path=os.path.dirname(
-            ASTERISK_LOG
-        ),
-
-        recursive=False
-
-    )
-
-    observer.start()
-
-    try:
-
-        while True:
-            time.sleep(1)
-
-    except KeyboardInterrupt:
-
-        observer.stop()
-
-    observer.join()
-
-
-if __name__ == "__main__":
-
-    main()
+    # File
