@@ -24,6 +24,19 @@ PRIVATE_IP_PATTERNS = [
 ]
 
 
+# Modules that only ever produce normal, expected call-flow noise.
+# If a line isn't a security/attack event and belongs to one of
+# these modules, it should be classified as an informational
+# system log, not "OTHER" / unknown.
+INTERNAL_MODULES = {
+    "channel.c",
+    "pbx.c",
+    "app_dial.c",
+    "bridge_channel.c",
+    "core_local.c",
+}
+
+
 def is_private_ip(ip):
     for pattern in PRIVATE_IP_PATTERNS:
         if re.match(pattern, ip):
@@ -75,14 +88,6 @@ class LogParser:
 
     # --------------------------------------------------
     # Extract Source IP
-    #
-    # Strategy:
-    #   1. Try high-confidence, structured patterns first
-    #      (SecurityEvent RemoteAddress, "from", "received from").
-    #   2. If nothing structured matches, fall back to scanning
-    #      every IP-looking token and prefer a PUBLIC one over a
-    #      private/local one (avoids grabbing your own LAN IP out
-    #      of a Via: or Contact: header).
     # --------------------------------------------------
 
     def extract_ip(self, line):
@@ -114,10 +119,6 @@ class LogParser:
 
     # --------------------------------------------------
     # Extract Account / Extension ID
-    #
-    # Present on Asterisk SecurityEvent lines, e.g.
-    # AccountID="2002". Not present on every line - callers
-    # should treat "UNKNOWN" as "not available in this line".
     # --------------------------------------------------
 
     def extract_account_id(self, line):
@@ -127,23 +128,26 @@ class LogParser:
         if match:
             return match.group(1)
 
+        # Also try to pick up an extension number from call-flow
+        # lines like "PJSIP/2001-00000011" or "[2001@internal:1]"
+        ext_match = re.search(r"PJSIP/(\d{3,6})-", line)
+
+        if ext_match:
+            return ext_match.group(1)
+
+        ext_match = re.search(r"\[(\d{3,6})@internal", line)
+
+        if ext_match:
+            return ext_match.group(1)
+
         return "UNKNOWN"
 
     # --------------------------------------------------
     # Extract Toll-Fraud Destination Number
-    #
-    # Two real patterns seen in production Asterisk logs:
-    #
-    #   1. Dial(SIP/trunk/00441234567890) or ...+971...
-    #   2. Local/919566704154__<call-id>...
-    #      (seen in core_local.c "without a @context" warnings)
-    #
-    # Returns the destination number as a string, or None.
     # --------------------------------------------------
 
     def extract_toll_destination(self, line):
 
-        # Pattern 1: Dial() with international prefix
         dial_match = re.search(
             r"DIAL\([^)]*(?:\+|00)(\d{9,15})",
             line.upper()
@@ -152,7 +156,6 @@ class LogParser:
         if dial_match:
             return dial_match.group(1)
 
-        # Pattern 2: Local/<number>__<call-id>
         local_match = re.search(
             r"Local/(\d{9,15})__",
             line
@@ -161,7 +164,6 @@ class LogParser:
         if local_match:
             return local_match.group(1)
 
-        # Pattern 3: bare "TOLL" keyword mention with a nearby number
         if "TOLL" in line.upper():
             bare_number = re.search(r"(\d{9,15})", line)
             if bare_number:
@@ -183,6 +185,15 @@ class LogParser:
         elif "CORE_LOCAL.C" in upper:
             return "core_local.c"
 
+        elif "BRIDGE_CHANNEL.C" in upper:
+            return "bridge_channel.c"
+
+        elif "APP_DIAL.C" in upper:
+            return "app_dial.c"
+
+        elif "PBX.C" in upper:
+            return "pbx.c"
+
         elif "CHANNEL.C" in upper:
             return "channel.c"
 
@@ -197,12 +208,6 @@ class LogParser:
 
         elif "RTP" in upper:
             return "rtp"
-
-        elif "PBX.C" in upper:
-            return "pbx.c"
-
-        elif "APP_DIAL.C" in upper:
-            return "app_dial.c"
 
         return "UNKNOWN"
 
@@ -240,6 +245,12 @@ class LogParser:
 
     # --------------------------------------------------
     # Classify Event
+    #
+    # Order matters: security/attack signals are checked first.
+    # Only if none of those match do we fall back to asking
+    # "which internal module produced this line" - that catches
+    # normal call-flow noise (pbx.c, app_dial.c, bridge_channel.c,
+    # channel.c, core_local.c) instead of dumping it into OTHER.
     # --------------------------------------------------
 
     def classify_event(self, line):
@@ -266,7 +277,7 @@ class LogParser:
         elif 'SECURITYEVENT="REQUESTNOTALLOWED"' in upper:
             return "REQUEST_BLOCKED"
 
-        # ---------- Generic Events ----------
+        # ---------- Generic Security Events ----------
 
         elif "FAILED AUTHENTICATION" in upper:
             return "FAILED_AUTH"
@@ -283,6 +294,11 @@ class LogParser:
         elif self.extract_toll_destination(line) is not None:
             return "TOLL_FRAUD"
 
+        elif "NO MATCHING ENDPOINT" in upper:
+            return "UNKNOWN_ENDPOINT"
+
+        # ---------- SIP Methods (only if not already claimed above) ----------
+
         elif "REGISTER" in upper:
             return "REGISTER"
 
@@ -292,24 +308,23 @@ class LogParser:
         elif "OPTIONS" in upper:
             return "OPTIONS"
 
-        elif "NO MATCHING ENDPOINT" in upper:
-            return "UNKNOWN_ENDPOINT"
+        # ---------- Fall back to module-based classification ----------
 
-        # ---------- System Events ----------
+        module = self.detect_module(line)
 
-        elif "CHANNEL.C" in upper:
+        if module in INTERNAL_MODULES:
             return "SYSTEM_LOG"
 
-        elif "FUNC_ODBC.C" in upper:
+        elif module == "func_odbc.c":
             return "DATABASE_LOG"
 
-        elif "RES_PJSIP" in upper:
+        elif module == "res_pjsip":
             return "PJSIP_LOG"
 
-        elif "CHAN_SIP" in upper:
+        elif module == "chan_sip":
             return "CHAN_SIP_LOG"
 
-        elif "RTP" in upper:
+        elif module == "rtp":
             return "RTP_LOG"
 
         return "OTHER"
@@ -353,15 +368,15 @@ if __name__ == "__main__":
 
         '[Jul 22 10:10:15] NOTICE Failed Authentication from "185.22.11.5" using REGISTER',
 
-        '[Jul 22 10:10:20] NOTICE Received SIP INVITE from 192.168.1.20',
+        '[Jul 25 06:59:04] VERBOSE[22417][C-00000009] pbx.c: Executing [2001@internal:1] Dial("PJSIP/2002-00000010", "PJSIP/2001") in new stack',
 
-        '[Jul 22 10:10:30] SECURITY SecurityEvent="ChallengeSent" RemoteAddress="IPV4/UDP/192.168.1.192/57948"',
+        '[Jul 25 06:59:09] VERBOSE[22417][C-00000009] app_dial.c: Called PJSIP/2001',
 
-        '[Jul 24 09:53:41] SECURITY[1386] res_security_log.c: SecurityEvent="SuccessfulAuth",AccountID="2002",LocalAddress="IPV4/UDP/192.168.1.76/5060",RemoteAddress="IPV4/UDP/192.168.1.192/60941"',
+        '[Jul 25 06:59:13] VERBOSE[22423][C-00000009] bridge_channel.c: Channel PJSIP/2001-00000011 joined \'simple_bridge\' basic-bridge <86f2d15a-0c58-44cd-b0ba-1e6545808aea>',
+
+        '[Jul 25 06:59:30] VERBOSE[22423][C-00000009] app_dial.c: PJSIP/2001-00000011 left \'native_rtp\'',
 
         '[2026-07-24 15:40:38.311] WARNING[1643562] core_local.c: Someone used Local/919566704154__7e36d5ab-7958-43ac-b89e-b3889244b808__8d18d75e-0dac-4e97 somewhere without a @context. This is bad.',
-
-        '[Jul 22 10:10:34] NOTICE Dial(SIP/trunk-out/00441234567890) from ext 1001',
 
     ]
 
