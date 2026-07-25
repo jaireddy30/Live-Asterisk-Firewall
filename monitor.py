@@ -28,20 +28,26 @@ from firewall import Firewall
 init(autoreset=True)
 
 
-# Events the parser can classify but that are NOT attacks by
-# themselves. These should be reported as "recognized, no
-# action needed" rather than "unsupported/unknown".
-KNOWN_NON_ATTACK_EVENTS = {
+# Event types that are recognized but are NOT attacks. Reason
+# text is static for auth-related events, and built dynamically
+# (using the module field) for internal system log events.
+STATIC_NON_ATTACK_REASONS = {
 
     "AUTH_CHALLENGE": "Authentication challenge sent (normal SIP handshake)",
     "AUTH_SUCCESS": "Successful authentication",
     "REGISTER_SUCCESS": "Successful registration",
-    "SYSTEM_LOG": "Internal system log (channel.c)",
-    "DATABASE_LOG": "Internal database log (func_odbc.c)",
-    "PJSIP_LOG": "PJSIP stack log, not a security event",
-    "CHAN_SIP_LOG": "chan_sip stack log, not a security event",
-    "RTP_LOG": "RTP media log, not a security event",
 
+}
+
+# These event types get a reason built from parsed_event['module']
+# instead of a fixed string, since they can come from several
+# different modules (pbx.c, app_dial.c, bridge_channel.c, etc.)
+DYNAMIC_MODULE_EVENTS = {
+    "SYSTEM_LOG",
+    "DATABASE_LOG",
+    "PJSIP_LOG",
+    "CHAN_SIP_LOG",
+    "RTP_LOG",
 }
 
 
@@ -89,25 +95,21 @@ class LogMonitor(FileSystemEventHandler):
 
             print(Fore.GREEN + f"🕒 Timestamp        : {parsed_event['timestamp']}")
 
-            # Source IP
             if parsed_event["source_ip"] != "UNKNOWN":
                 print(Fore.GREEN + f"✅ Source IP        : {parsed_event['source_ip']}")
             else:
                 print(Fore.RED + "❌ Source IP        : Not Found")
 
-            # SIP Method
             if parsed_event["method"] != "UNKNOWN":
                 print(Fore.GREEN + f"✅ SIP Method       : {parsed_event['method']}")
             else:
                 print(Fore.RED + "❌ SIP Method       : Not Found")
 
-            # Event Type
             if parsed_event["event"] != "OTHER":
                 print(Fore.GREEN + f"✅ Event Type       : {parsed_event['event']}")
             else:
                 print(Fore.RED + "❌ Event Type       : Unknown")
 
-            # Authentication
             if parsed_event["event"] == "FAILED_AUTH":
                 print(Fore.GREEN + "✅ Authentication   : Failed")
             elif parsed_event["event"] == "AUTH_SUCCESS":
@@ -115,31 +117,25 @@ class LogMonitor(FileSystemEventHandler):
             else:
                 print(Fore.RED + "❌ Authentication   : Not Found")
 
-            # REGISTER
             if parsed_event["method"] == "REGISTER":
                 print(Fore.GREEN + "✅ REGISTER         : Detected")
             else:
                 print(Fore.RED + "❌ REGISTER         : Not Found")
 
-            # INVITE
             if parsed_event["method"] == "INVITE":
                 print(Fore.GREEN + "✅ INVITE           : Detected")
             else:
                 print(Fore.RED + "❌ INVITE           : Not Found")
 
-            # OPTIONS
             if parsed_event["method"] == "OPTIONS":
                 print(Fore.GREEN + "✅ OPTIONS          : Detected")
             else:
                 print(Fore.RED + "❌ OPTIONS          : Not Found")
 
-            # Module Detection
-            if "func_odbc.c" in line:
-                print(Fore.YELLOW + "ℹ️ Module           : func_odbc.c")
-            elif "res_pjsip" in line:
-                print(Fore.YELLOW + "ℹ️ Module           : res_pjsip")
-            elif "chan_sip" in line:
-                print(Fore.YELLOW + "ℹ️ Module           : chan_sip")
+            # Module - use the parser's own detection instead of
+            # a separate, incomplete hardcoded check.
+            if parsed_event["module"] != "UNKNOWN":
+                print(Fore.YELLOW + f"ℹ️ Module           : {parsed_event['module']}")
 
             print(Fore.CYAN + "============================================================")
 
@@ -164,49 +160,29 @@ class LogMonitor(FileSystemEventHandler):
                 print(Fore.YELLOW + "============================================================")
 
                 event_type = parsed_event["event"]
+                module = parsed_event["module"]
 
-                # --------------------------------------------
-                # Case 1: Parser recognized the event, it's just
-                # not an attack (e.g. AUTH_SUCCESS, AUTH_CHALLENGE)
-                # --------------------------------------------
+                print(Fore.YELLOW + "Status          : Ignored")
 
-                if event_type in KNOWN_NON_ATTACK_EVENTS:
+                if event_type in STATIC_NON_ATTACK_REASONS:
 
-                    print(Fore.YELLOW + "Status          : Ignored")
-                    print(Fore.YELLOW + f"Reason          : {KNOWN_NON_ATTACK_EVENTS[event_type]}")
+                    print(Fore.YELLOW + f"Reason          : {STATIC_NON_ATTACK_REASONS[event_type]}")
                     print(Fore.YELLOW + f"Event Type      : {event_type}")
 
-                # --------------------------------------------
-                # Case 2: Parser genuinely could not classify
-                # the line (event == "OTHER")
-                # --------------------------------------------
+                elif event_type in DYNAMIC_MODULE_EVENTS:
+
+                    print(Fore.YELLOW + f"Reason          : Internal Asterisk log, not a security event")
+                    print(Fore.YELLOW + f"Module          : {module}")
+                    print(Fore.YELLOW + f"Event Type      : {event_type}")
 
                 elif event_type == "OTHER":
 
-                    print(Fore.YELLOW + "Status          : Ignored")
-
-                    if "func_odbc.c" in line:
-                        print(Fore.YELLOW + "Reason          : Not a SIP Security Event")
-                        print(Fore.YELLOW + "Module          : func_odbc.c")
-                    elif "res_pjsip" in line:
-                        print(Fore.YELLOW + "Reason          : SIP Event Not Matching Detection Rules")
-                        print(Fore.YELLOW + "Module          : res_pjsip")
-                    elif "chan_sip" in line:
-                        print(Fore.YELLOW + "Reason          : SIP Event Not Matching Detection Rules")
-                        print(Fore.YELLOW + "Module          : chan_sip")
-                    else:
-                        print(Fore.YELLOW + "Reason          : Unsupported or Unknown Log")
-                        print(Fore.YELLOW + "Module          : Unknown")
-
-                # --------------------------------------------
-                # Case 3: Recognized event, below attack
-                # threshold (e.g. one failed auth, one OPTIONS)
-                # --------------------------------------------
+                    print(Fore.YELLOW + "Reason          : Unsupported or Unknown Log")
+                    print(Fore.YELLOW + f"Module          : {module}")
 
                 else:
 
-                    print(Fore.YELLOW + "Status          : Ignored")
-                    print(Fore.YELLOW + f"Reason          : Recognized event, below attack threshold")
+                    print(Fore.YELLOW + "Reason          : Recognized event, below attack threshold")
                     print(Fore.YELLOW + f"Event Type      : {event_type}")
 
                 print(Fore.YELLOW + "Threat Level    : None")
