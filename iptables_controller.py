@@ -20,6 +20,7 @@ Author:
 """
 
 import platform
+import re                  # FIX: added missing import for IP validation
 import subprocess
 import os
 import pandas as pd
@@ -36,20 +37,9 @@ class IPTablesController:
 
         if not os.path.exists(BLOCK_FILE):
 
-            df = pd.DataFrame(columns=[
+            df = pd.DataFrame(columns=["ip", "status"])
 
-                "ip",
-                "status"
-
-            ])
-
-            df.to_csv(
-
-                BLOCK_FILE,
-
-                index=False
-
-            )
+            df.to_csv(BLOCK_FILE, index=False)
 
     # --------------------------------------------
     # Save Blocked IP
@@ -61,21 +51,9 @@ class IPTablesController:
 
         if ip not in df["ip"].values:
 
-            df.loc[len(df)] = [
+            df.loc[len(df)] = [ip, "BLOCKED"]
 
-                ip,
-
-                "BLOCKED"
-
-            ]
-
-            df.to_csv(
-
-                BLOCK_FILE,
-
-                index=False
-
-            )
+            df.to_csv(BLOCK_FILE, index=False)
 
     # --------------------------------------------
     # Block IP
@@ -83,10 +61,18 @@ class IPTablesController:
 
     def block_ip(self, ip):
 
+        # FIX: Guard against blocking placeholder / invalid IPs.
+        # Toll-fraud events arrive with source_ip="UNKNOWN" because
+        # they are outbound calls placed by your own PBX.
+        # Passing "UNKNOWN" to iptables causes an error on Linux and
+        # writes garbage into blocked_ips.csv on any OS.
+        if not ip or not re.match(r"^\d{1,3}(\.\d{1,3}){3}$", ip):
+            print(f"Skipping block for invalid/unknown IP: {ip}")
+            return
+
         system = platform.system()
 
         print()
-
         print("Blocking :", ip)
 
         # ----------------------------------------
@@ -95,42 +81,13 @@ class IPTablesController:
 
         if system == "Linux":
 
-            command = [
-
-                "sudo",
-
-                "iptables",
-
-                "-A",
-
-                "INPUT",
-
-                "-s",
-
-                ip,
-
-                "-j",
-
-                "DROP"
-
-            ]
+            command = ["sudo", "iptables", "-A", "INPUT", "-s", ip, "-j", "DROP"]
 
             try:
-
-                subprocess.run(
-
-                    command,
-
-                    check=True
-
-                )
-
+                subprocess.run(command, check=True)
                 print("iptables rule added.")
-
             except Exception as e:
-
                 print("iptables failed")
-
                 print(e)
 
         # ----------------------------------------
@@ -138,18 +95,8 @@ class IPTablesController:
         # ----------------------------------------
 
         else:
-
-            print(
-
-                "Windows detected."
-
-            )
-
-            print(
-
-                "Simulating firewall block."
-
-            )
+            print("Windows detected.")
+            print("Simulating firewall block.")
 
         self.save_blocked_ip(ip)
 
@@ -162,58 +109,20 @@ class IPTablesController:
         system = platform.system()
 
         print()
-
         print("Removing :", ip)
 
         if system == "Linux":
 
-            command = [
-
-                "sudo",
-
-                "iptables",
-
-                "-D",
-
-                "INPUT",
-
-                "-s",
-
-                ip,
-
-                "-j",
-
-                "DROP"
-
-            ]
+            command = ["sudo", "iptables", "-D", "INPUT", "-s", ip, "-j", "DROP"]
 
             try:
-
-                subprocess.run(
-
-                    command,
-
-                    check=True
-
-                )
-
-                print(
-
-                    "Rule removed."
-
-                )
-
+                subprocess.run(command, check=True)
+                print("Rule removed.")
             except Exception as e:
-
                 print(e)
 
         else:
-
-            print(
-
-                "Windows simulation."
-
-            )
+            print("Windows simulation.")
 
     # --------------------------------------------
     # Show Current Rules
@@ -224,25 +133,9 @@ class IPTablesController:
         system = platform.system()
 
         if system == "Linux":
-
-            subprocess.run(
-
-                [
-
-                    "sudo",
-
-                    "iptables",
-
-                    "-L"
-
-                ]
-
-            )
-
+            subprocess.run(["sudo", "iptables", "-L"])
         else:
-
             df = pd.read_csv(BLOCK_FILE)
-
             print(df)
 
 
@@ -253,11 +146,5 @@ class IPTablesController:
 if __name__ == "__main__":
 
     fw = IPTablesController()
-
-    fw.block_ip(
-
-        "185.22.11.5"
-
-    )
-
+    fw.block_ip("185.22.11.5")
     fw.show_rules()
