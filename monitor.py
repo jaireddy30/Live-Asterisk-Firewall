@@ -1,8 +1,12 @@
 """
 ====================================================
+
 LIVE ASTERISK FIREWALL
 
-MODULE 1 - MAIN ENTRY POINT
+MODULE 1
+
+MAIN ENTRY POINT
+
 ====================================================
 """
 
@@ -17,19 +21,20 @@ from colorama import init
 
 from config import ASTERISK_LOG
 
-# FIX: renamed from 'parser' to 'log_parser' to avoid collision
-# with Python's stdlib 'parser' module (removed in Python 3.12).
 from log_parser import LogParser
 from detector import Detector
 from firewall import Firewall
+from ip_lookup import lookup_ip, format_ip_info, lookup_phone_country
 
 init(autoreset=True)
 
 
 STATIC_NON_ATTACK_REASONS = {
-    "AUTH_CHALLENGE":   "Authentication challenge sent (normal SIP handshake)",
-    "AUTH_SUCCESS":     "Successful authentication",
+
+    "AUTH_CHALLENGE": "Authentication challenge sent (normal SIP handshake)",
+    "AUTH_SUCCESS": "Successful authentication",
     "REGISTER_SUCCESS": "Successful registration",
+
 }
 
 DYNAMIC_MODULE_EVENTS = {
@@ -40,33 +45,10 @@ DYNAMIC_MODULE_EVENTS = {
     "RTP_LOG",
 }
 
-# Marker that starts a multi-line raw SIP message dump, e.g.:
-#   VERBOSE[20588] res_pjsip_logger.c: <--- Transmitting SIP response (521 bytes) to UDP:192.168.1.15:55714 --->
-# Everything until the NEXT bracketed Asterisk log line belongs
-# to THIS message and must be parsed together, not line-by-line -
-# otherwise the IP (in Via:/Contact:) and the method (in the
-# request line or CSeq:) end up split across separate,
-# uncorrelated events.
-#
-# NOTE: we deliberately do NOT use a blank line as the block
-# terminator. SIP messages with a body (e.g. INVITE with SDP)
-# contain a blank line INSIDE the message, separating headers
-# from the SDP body - using blank lines as the terminator would
-# cut the block short and dump the SDP body as garbage separate
-# entries. Every genuine new Asterisk log statement starts with
-# "[timestamp]" - SIP header/body lines never do - so that is
-# a much more reliable boundary.
 SIP_BLOCK_MARKER = "<---"
 
 
 def is_new_log_entry(line):
-    """
-    True if this line looks like the start of a brand new
-    Asterisk log statement (starts with a bracketed timestamp),
-    e.g. "[Jul 25 07:46:53] VERBOSE[...] ...".
-    SIP header/body lines (Via:, Call-ID:, blank lines, SDP
-    fields like "v=0") never start this way.
-    """
     stripped = line.lstrip()
     return stripped.startswith("[")
 
@@ -75,7 +57,19 @@ class LogMonitor(FileSystemEventHandler):
 
     def __init__(self):
 
-        self.file = open(ASTERISK_LOG, "r")
+        # FIX 1: Call super().__init__() so watchdog's
+        # FileSystemEventHandler is properly initialised.
+        super().__init__()
+
+        # FIX 2: Wrap open() so a missing log file prints a
+        # clear message instead of an unhandled traceback.
+        try:
+            self.file = open(ASTERISK_LOG, "r", encoding="utf-8", errors="replace")
+        except FileNotFoundError:
+            print(Fore.RED + f"[ERROR] Log file not found: {ASTERISK_LOG}")
+            print(Fore.RED + "       Make sure Asterisk is running and the path is correct.")
+            raise SystemExit(1)
+
         self.file.seek(0, os.SEEK_END)
 
         self.parser   = LogParser()
@@ -83,13 +77,16 @@ class LogMonitor(FileSystemEventHandler):
         self.firewall = Firewall()
 
         # Buffering state for multi-line SIP message blocks
-        self._in_sip_block   = False
+        self._in_sip_block    = False
         self._sip_block_lines = []
 
-    # -----------------------------------------------------
-    # Process one fully-assembled "line" (either a normal
-    # single log line, or a joined multi-line SIP block)
-    # -----------------------------------------------------
+    # FIX 3: Close the file handle when the monitor is destroyed
+    def __del__(self):
+        try:
+            if self.file and not self.file.closed:
+                self.file.close()
+        except AttributeError:
+            pass
 
     def process_entry(self, text):
 
@@ -104,49 +101,76 @@ class LogMonitor(FileSystemEventHandler):
         print(Fore.CYAN + "PARSER ANALYSIS")
         print(Fore.CYAN + "============================================================")
 
-        print(Fore.GREEN + f"🕒 Timestamp        : {parsed_event['timestamp']}")
+        print(Fore.GREEN + f"[TIME] Timestamp        : {parsed_event['timestamp']}")
 
         if parsed_event["source_ip"] != "UNKNOWN":
-            print(Fore.GREEN + f"✅ Source IP        : {parsed_event['source_ip']}")
+            print(Fore.GREEN + f"[OK] Source IP         : {parsed_event['source_ip']}")
         else:
-            print(Fore.RED + "❌ Source IP        : Not Found")
+            print(Fore.RED + "[--] Source IP         : Not Found")
 
         if parsed_event["method"] != "UNKNOWN":
-            print(Fore.GREEN + f"✅ SIP Method       : {parsed_event['method']}")
+            print(Fore.GREEN + f"[OK] SIP Method        : {parsed_event['method']}")
         else:
-            print(Fore.RED + "❌ SIP Method       : Not Found")
+            print(Fore.RED + "[--] SIP Method        : Not Found")
 
         if parsed_event["event"] != "OTHER":
-            print(Fore.GREEN + f"✅ Event Type       : {parsed_event['event']}")
+            print(Fore.GREEN + f"[OK] Event Type        : {parsed_event['event']}")
         else:
-            print(Fore.RED + "❌ Event Type       : Unknown")
+            print(Fore.RED + "[--] Event Type        : Unknown")
 
         if parsed_event["event"] == "FAILED_AUTH":
-            print(Fore.GREEN + "✅ Authentication   : Failed")
+            print(Fore.GREEN + "[OK] Authentication    : Failed")
         elif parsed_event["event"] == "AUTH_SUCCESS":
-            print(Fore.GREEN + "✅ Authentication   : Success")
+            print(Fore.GREEN + "[OK] Authentication    : Success")
         else:
-            print(Fore.RED + "❌ Authentication   : Not Found")
+            print(Fore.RED + "[--] Authentication    : Not Found")
 
         if parsed_event["method"] == "REGISTER":
-            print(Fore.GREEN + "✅ REGISTER         : Detected")
+            print(Fore.GREEN + "[OK] REGISTER          : Detected")
         else:
-            print(Fore.RED + "❌ REGISTER         : Not Found")
+            print(Fore.RED + "[--] REGISTER          : Not Found")
 
         if parsed_event["method"] == "INVITE":
-            print(Fore.GREEN + "✅ INVITE           : Detected")
+            print(Fore.GREEN + "[OK] INVITE            : Detected")
         else:
-            print(Fore.RED + "❌ INVITE           : Not Found")
+            print(Fore.RED + "[--] INVITE            : Not Found")
 
         if parsed_event["method"] == "OPTIONS":
-            print(Fore.GREEN + "✅ OPTIONS          : Detected")
+            print(Fore.GREEN + "[OK] OPTIONS           : Detected")
         else:
-            print(Fore.RED + "❌ OPTIONS          : Not Found")
+            print(Fore.RED + "[--] OPTIONS           : Not Found")
 
         if parsed_event["module"] != "UNKNOWN":
-            print(Fore.YELLOW + f"ℹ️  Module           : {parsed_event['module']}")
+            print(Fore.YELLOW + f"[i]  Module            : {parsed_event['module']}")
 
         print(Fore.CYAN + "============================================================")
+
+        # --------------------------------------------------
+        # IP Geolocation — show where the IP is coming from
+        # --------------------------------------------------
+        src_ip = parsed_event["source_ip"]
+        if src_ip and src_ip != "UNKNOWN":
+            print(Fore.MAGENTA + "\n============================================================")
+            print(Fore.MAGENTA + "IP GEOLOCATION")
+            print(Fore.MAGENTA + "============================================================")
+            print(Fore.MAGENTA + f"  IP        : {src_ip}")
+            geo = lookup_ip(src_ip)
+            print(Fore.MAGENTA + format_ip_info(geo))
+            print(Fore.MAGENTA + "============================================================")
+
+        # --------------------------------------------------
+        # Toll Fraud destination country
+        # --------------------------------------------------
+        destination = parsed_event.get("destination")
+        if destination and parsed_event["event"] == "TOLL_FRAUD":
+            country, prefix = lookup_phone_country(destination)
+            print(Fore.MAGENTA + "\n============================================================")
+            print(Fore.MAGENTA + "TOLL FRAUD DESTINATION")
+            print(Fore.MAGENTA + "============================================================")
+            print(Fore.MAGENTA + f"  Number    : +{destination}")
+            print(Fore.MAGENTA + f"  Prefix    : {prefix}")
+            print(Fore.MAGENTA + f"  Country   : {country}")
+            print(Fore.MAGENTA + "============================================================")
 
         attack = self.detector.detect(parsed_event)
 
@@ -187,11 +211,6 @@ class LogMonitor(FileSystemEventHandler):
             print(Fore.YELLOW + "Monitoring      : Continue")
             print(Fore.YELLOW + "============================================================")
 
-    # -----------------------------------------------------
-    # File watcher callback - reads raw lines and buffers
-    # multi-line SIP blocks before handing off to process_entry
-    # -----------------------------------------------------
-
     def on_modified(self, event):
 
         if event.src_path != ASTERISK_LOG:
@@ -210,9 +229,6 @@ class LogMonitor(FileSystemEventHandler):
 
             if self._in_sip_block:
 
-                # A brand new bracketed log entry means the PREVIOUS
-                # SIP block has ended (regardless of blank lines in
-                # its body). Flush it now.
                 if is_new_log_entry(line):
 
                     full_block = "".join(self._sip_block_lines)
@@ -220,30 +236,18 @@ class LogMonitor(FileSystemEventHandler):
                     self._sip_block_lines = []
                     self.process_entry(full_block)
 
-                    # This new line might itself start another SIP
-                    # block, or just be a normal single log line -
-                    # fall through to handle it below.
-
                 else:
-                    # Still inside the previous SIP message (this
-                    # covers blank lines inside an SDP body too)
                     self._sip_block_lines.append(line)
                     continue
 
-            # Start of a new multi-line raw SIP message dump
             if is_marker_line:
                 self._in_sip_block    = True
                 self._sip_block_lines = [line]
                 continue
 
-            # Skip standalone blank lines between unrelated log
-            # entries - they carry no information and would
-            # otherwise be parsed as a meaningless empty event.
             if not line.strip():
                 continue
 
-            # Normal single-line log entry (SecurityEvent, VERBOSE
-            # call-flow lines, etc.) - process immediately
             self.process_entry(line)
 
 
@@ -262,8 +266,6 @@ def main():
 
     observer.schedule(
         LogMonitor(),
-        # FIX: os.path.dirname("bare/path") can return "" which
-        # crashes Observer.schedule — fall back to current directory.
         path=os.path.dirname(ASTERISK_LOG) or ".",
         recursive=False
     )
