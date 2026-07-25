@@ -46,11 +46,33 @@ DYNAMIC_MODULE_EVENTS = {
 
 # Marker that starts a multi-line raw SIP message dump, e.g.:
 #   VERBOSE[20588] res_pjsip_logger.c: <--- Transmitting SIP response (521 bytes) to UDP:192.168.1.15:55714 --->
-# Everything until the next blank line belongs to THIS message
-# and must be parsed together, not line-by-line - otherwise the
-# IP (in Via:/Contact:) and the method (in the request line or
-# CSeq:) end up split across separate, uncorrelated events.
+# Everything until the NEXT bracketed Asterisk log line belongs
+# to THIS message and must be parsed together, not line-by-line -
+# otherwise the IP (in Via:/Contact:) and the method (in the
+# request line or CSeq:) end up split across separate,
+# uncorrelated events.
+#
+# NOTE: we deliberately do NOT use a blank line as the block
+# terminator. SIP messages with a body (e.g. INVITE with SDP)
+# contain a blank line INSIDE the message, separating headers
+# from the SDP body - using blank lines as the terminator would
+# cut the block short and dump the SDP body as garbage separate
+# entries. Every genuine new Asterisk log statement starts with
+# "[timestamp]" - SIP header/body lines never do - so that is
+# a much more reliable boundary.
 SIP_BLOCK_MARKER = "<---"
+
+
+def is_new_log_entry(line):
+    """
+    True if this line looks like the start of a brand new
+    Asterisk log statement (starts with a bracketed timestamp),
+    e.g. "[Jul 25 07:46:53] VERBOSE[...] ...".
+    SIP header/body lines (Via:, Call-ID:, blank lines, SDP
+    fields like "v=0") never start this way.
+    """
+    stripped = line.lstrip()
+    return stripped.startswith("[")
 
 
 class LogMonitor(FileSystemEventHandler):
@@ -195,30 +217,46 @@ class LogMonitor(FileSystemEventHandler):
             if not line:
                 break
 
-            # Start of a new multi-line raw SIP message dump
-            if SIP_BLOCK_MARKER in line and (
+            is_marker_line = SIP_BLOCK_MARKER in line and (
                 "Transmitting SIP" in line or "Received SIP" in line
-            ):
-                self._in_sip_block = True
-                self._sip_block_lines = [line]
-                continue
+            )
 
             if self._in_sip_block:
 
-                if line.strip() == "":
-                    # Blank line = end of this SIP message block.
-                    # Join everything and process it as ONE entry.
+                # A brand new bracketed log entry means the PREVIOUS
+                # SIP block has ended (regardless of blank lines in
+                # its body). Flush it now.
+                if is_new_log_entry(line):
+
                     full_block = "".join(self._sip_block_lines)
                     self._in_sip_block = False
                     self._sip_block_lines = []
                     self.process_entry(full_block)
-                else:
-                    self._sip_block_lines.append(line)
 
+                    # This new line might itself start another SIP
+                    # block, or just be a normal single log line -
+                    # fall through to handle it below.
+
+                else:
+                    # Still inside the previous SIP message (this
+                    # covers blank lines inside an SDP body too)
+                    self._sip_block_lines.append(line)
+                    continue
+
+            # Start of a new multi-line raw SIP message dump
+            if is_marker_line:
+                self._in_sip_block = True
+                self._sip_block_lines = [line]
+                continue
+
+            # Skip standalone blank lines between unrelated log
+            # entries - they carry no information and would
+            # otherwise be parsed as a meaningless empty event.
+            if not line.strip():
                 continue
 
             # Normal single-line log entry (SecurityEvent, VERBOSE
-            # call-flow lines, etc.) - process immediately as before
+            # call-flow lines, etc.) - process immediately
             self.process_entry(line)
 
 
