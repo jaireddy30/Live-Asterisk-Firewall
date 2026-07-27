@@ -4,24 +4,27 @@ Live Asterisk Firewall
 
 firewall.py
 
-Purpose
---------
-Receives detected attacks from detector.py
-and decides what action to take.
+Purpose:
+    Receives detected attacks from detector.py
+    and decides what action to take.
 
 Author:
     Jai
 ===========================================================
 """
 
-from logger import FirewallLogger
+from colorama import Fore, init
+
+from logger              import FirewallLogger
 from iptables_controller import IPTablesController
+
+init(autoreset=True)
 
 
 class Firewall:
 
     def __init__(self):
-        self.logger = FirewallLogger()
+        self.logger   = FirewallLogger()
         self.iptables = IPTablesController()
 
     # -------------------------------------------------
@@ -33,42 +36,55 @@ class Firewall:
         if attack is None:
             return
 
-        ip = attack["source_ip"]
+        # ── key is "ip" from detector.py ──
+        ip          = attack["ip"]
         attack_type = attack["attack"]
-        severity = attack["severity"]
+        severity    = attack["severity"]
 
-        print("\n===================================")
-        print("FIREWALL DECISION ENGINE")
-        print("===================================")
-        print("IP :", ip)
-        print("Attack :", attack_type)
-        print("Severity :", severity)
+        print(Fore.RED + "\n====================================")
+        print(Fore.RED + "ATTACK DETECTED")
+        print(Fore.RED + "====================================")
+        print(Fore.RED + f"IP        : {ip}")
+        print(Fore.RED + f"Attack    : {attack_type}")
+        print(Fore.RED + f"Severity  : {severity}")
+
+        print(Fore.YELLOW + "\n===================================")
+        print(Fore.YELLOW + "FIREWALL DECISION ENGINE")
+        print(Fore.YELLOW + "===================================")
+        print(Fore.YELLOW + f"IP       : {ip}")
+        print(Fore.YELLOW + f"Attack   : {attack_type}")
+        print(Fore.YELLOW + f"Severity : {severity}")
 
         # ---------------------------------------------
-        # Critical
+        # Decision based on severity
         # ---------------------------------------------
 
         if severity == "CRITICAL":
             action = "BLOCK"
-            self.iptables.block_ip(ip)   # safe: block_ip skips "UNKNOWN"
+            print(Fore.RED + f"Blocking : {ip}")
+            self.iptables.block_ip(ip)
 
         elif severity == "HIGH":
             action = "BLOCK"
+            print(Fore.RED + f"Blocking : {ip}")
             self.iptables.block_ip(ip)
 
         elif severity == "MEDIUM":
             action = "MONITOR"
+            print(Fore.YELLOW + f"Action   : Monitoring {ip} (no block yet)")
 
         else:
             action = "ALLOW"
+            print(Fore.GREEN + f"Action   : Allowed — low severity")
 
-        print("Firewall Action :", action)
+        print(Fore.YELLOW + f"Firewall Action : {action}")
+        print(Fore.YELLOW + "===================================")
 
         self.logger.log(
-            ip=ip,
-            attack=attack_type,
-            severity=severity,
-            action=action
+            ip       = ip,
+            attack   = attack_type,
+            severity = severity,
+            action   = action
         )
 
 
@@ -81,9 +97,9 @@ if __name__ == "__main__":
     fw = Firewall()
 
     sample = {
-        "source_ip": "185.22.11.5",
-        "attack":    "BRUTE_FORCE",
-        "severity":  "HIGH"
+        "ip":       "185.22.11.5",   # ← fixed key
+        "attack":   "BRUTE_FORCE",
+        "severity": "HIGH"
     }
 
     fw.process_attack(sample)
