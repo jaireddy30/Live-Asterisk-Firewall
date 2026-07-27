@@ -30,11 +30,9 @@ init(autoreset=True)
 
 
 STATIC_NON_ATTACK_REASONS = {
-
     "AUTH_CHALLENGE": "Authentication challenge sent (normal SIP handshake)",
     "AUTH_SUCCESS": "Successful authentication",
     "REGISTER_SUCCESS": "Successful registration",
-
 }
 
 DYNAMIC_MODULE_EVENTS = {
@@ -57,12 +55,8 @@ class LogMonitor(FileSystemEventHandler):
 
     def __init__(self):
 
-        # FIX 1: Call super().__init__() so watchdog's
-        # FileSystemEventHandler is properly initialised.
         super().__init__()
 
-        # FIX 2: Wrap open() so a missing log file prints a
-        # clear message instead of an unhandled traceback.
         try:
             self.file = open(ASTERISK_LOG, "r", encoding="utf-8", errors="replace")
         except FileNotFoundError:
@@ -76,11 +70,9 @@ class LogMonitor(FileSystemEventHandler):
         self.detector = Detector()
         self.firewall = Firewall()
 
-        # Buffering state for multi-line SIP message blocks
         self._in_sip_block    = False
         self._sip_block_lines = []
 
-    # FIX 3: Close the file handle when the monitor is destroyed
     def __del__(self):
         try:
             if self.file and not self.file.closed:
@@ -90,10 +82,13 @@ class LogMonitor(FileSystemEventHandler):
 
     def process_entry(self, text):
 
+        # Show only the first summary line — hide raw SIP headers/body
+        first_line = text.strip().split('\n')[0]
+
         print(Fore.GREEN + "\n============================================================")
         print(Fore.GREEN + "LIVE LOG")
         print(Fore.GREEN + "============================================================")
-        print(text.strip())
+        print(first_line)
 
         parsed_event = self.parser.parse(text)
 
@@ -175,7 +170,6 @@ class LogMonitor(FileSystemEventHandler):
         attack = self.detector.detect(parsed_event)
 
         if attack:
-
             self.firewall.process_attack(attack)
 
         else:
@@ -230,7 +224,6 @@ class LogMonitor(FileSystemEventHandler):
             if self._in_sip_block:
 
                 if is_new_log_entry(line):
-
                     full_block = "".join(self._sip_block_lines)
                     self._in_sip_block    = False
                     self._sip_block_lines = []
@@ -256,20 +249,17 @@ def main():
     print("=" * 60)
     print("LIVE ASTERISK FIREWALL")
     print("=" * 60)
-
     print()
     print("Watching")
     print(ASTERISK_LOG)
     print()
 
     observer = Observer()
-
     observer.schedule(
         LogMonitor(),
         path=os.path.dirname(ASTERISK_LOG) or ".",
         recursive=False
     )
-
     observer.start()
 
     try:
