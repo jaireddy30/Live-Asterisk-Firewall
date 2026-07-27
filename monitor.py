@@ -1,12 +1,18 @@
 """
 ====================================================
-
 LIVE ASTERISK FIREWALL
 
-MODULE 1
+monitor.py
 
-MAIN ENTRY POINT
+Main entry point. Supports 3 modes:
+  1. AMI MODE     — direct Asterisk connection (best)
+  2. SNIFFER MODE — captures packets from port 5060
+  3. FILE MODE    — watches Asterisk log file (default)
 
+Set mode in config.py:
+  USE_AMI     = True  → AMI mode
+  USE_SNIFFER = True  → Packet sniffer mode
+  Both False          → File watcher mode
 ====================================================
 """
 
@@ -14,75 +20,103 @@ import os
 import time
 
 from watchdog.observers import Observer
-from watchdog.events import FileSystemEventHandler
+from watchdog.events    import FileSystemEventHandler
 
-from colorama import Fore
-from colorama import init
+from colorama import Fore, init
 
-from config import ASTERISK_LOG
+from config import (
+    ASTERISK_LOG,
+    USE_AMI,     AMI_HOST, AMI_PORT, AMI_USERNAME, AMI_SECRET,
+    USE_SNIFFER, SNIFF_INTERFACE, SNIFF_PORT,
+)
 
 from log_parser import LogParser
-from detector import Detector
-from firewall import Firewall
-from ip_lookup import lookup_ip, format_ip_info, lookup_phone_country
+from detector   import Detector
+from firewall   import Firewall
+from ip_lookup  import lookup_ip, format_ip_info, lookup_phone_country
 
 init(autoreset=True)
 
 
-STATIC_NON_ATTACK_REASONS = {
-    "AUTH_CHALLENGE": "Authentication challenge sent (normal SIP handshake)",
-    "AUTH_SUCCESS": "Successful authentication",
-    "REGISTER_SUCCESS": "Successful registration",
+# ----------------------------------------------------------
+# Status and Action Labels
+# ----------------------------------------------------------
+
+STATUS_LABELS = {
+    "AUTH_CHALLENGE":   "Informational",
+    "AUTH_SUCCESS":     "Allowed",
+    "REGISTER_SUCCESS": "Allowed",
+    "INVITE":           "Allowed",
+    "REGISTER":         "Allowed",
+    "OPTIONS":          "Allowed",
+    "BYE":              "Allowed",
+    "ACK":              "Allowed",
+    "OTHER":            "Allowed",
+    "SYSTEM_LOG":       "Internal",
+    "DATABASE_LOG":     "Internal",
+    "PJSIP_LOG":        "Internal",
+    "CHAN_SIP_LOG":      "Internal",
+    "RTP_LOG":          "Internal",
+}
+
+ACTION_LABELS = {
+    "AUTH_CHALLENGE":   "Monitoring",
+    "AUTH_SUCCESS":     "Monitoring",
+    "REGISTER_SUCCESS": "Monitoring",
+    "INVITE":           "Monitoring",
+    "REGISTER":         "Monitoring",
+    "OPTIONS":          "Monitoring",
+    "BYE":              "Monitoring",
+    "ACK":              "Monitoring",
+    "OTHER":            "Monitoring",
+    "SYSTEM_LOG":       "Skip",
+    "DATABASE_LOG":     "Skip",
+    "PJSIP_LOG":        "Skip",
+}
+
+REASON_LABELS = {
+    "AUTH_CHALLENGE":   "Authentication challenge — normal SIP handshake",
+    "AUTH_SUCCESS":     "Successful authentication — call permitted",
+    "INVITE":           "Call INVITE tracked — below flood threshold",
+    "REGISTER":         "REGISTER tracked — below flood threshold",
+    "OPTIONS":          "OPTIONS tracked — below flood threshold",
+    "SYSTEM_LOG":       "Internal Asterisk log — not a security event",
+    "DATABASE_LOG":     "Internal Asterisk log — not a security event",
+    "PJSIP_LOG":        "Internal Asterisk log — not a security event",
 }
 
 DYNAMIC_MODULE_EVENTS = {
-    "SYSTEM_LOG",
-    "DATABASE_LOG",
-    "PJSIP_LOG",
-    "CHAN_SIP_LOG",
-    "RTP_LOG",
+    "SYSTEM_LOG", "DATABASE_LOG",
+    "PJSIP_LOG",  "CHAN_SIP_LOG", "RTP_LOG",
 }
 
 SIP_BLOCK_MARKER = "<---"
 
 
 def is_new_log_entry(line):
-    stripped = line.lstrip()
-    return stripped.startswith("[")
+    return line.lstrip().startswith("[")
 
 
-class LogMonitor(FileSystemEventHandler):
+# ===========================================================
+# BASE CLASS — shared display and detection logic
+# ===========================================================
 
-    def __init__(self):
+class BaseMonitor:
 
-        super().__init__()
-
-        try:
-            self.file = open(ASTERISK_LOG, "r", encoding="utf-8", errors="replace")
-        except FileNotFoundError:
-            print(Fore.RED + f"[ERROR] Log file not found: {ASTERISK_LOG}")
-            print(Fore.RED + "       Make sure Asterisk is running and the path is correct.")
-            raise SystemExit(1)
-
-        self.file.seek(0, os.SEEK_END)
-
+    def _init_components(self):
         self.parser   = LogParser()
         self.detector = Detector()
         self.firewall = Firewall()
-
         self._in_sip_block    = False
         self._sip_block_lines = []
 
-    def __del__(self):
-        try:
-            if self.file and not self.file.closed:
-                self.file.close()
-        except AttributeError:
-            pass
+    # ----------------------------------------------------------
+    # Process one assembled log entry
+    # ----------------------------------------------------------
 
     def process_entry(self, text):
 
-        # Show only the first summary line — hide raw SIP headers/body
+        # Show only the first summary line — raw SIP body hidden
         first_line = text.strip().split('\n')[0]
 
         print(Fore.GREEN + "\n============================================================")
@@ -101,48 +135,43 @@ class LogMonitor(FileSystemEventHandler):
         if parsed_event["source_ip"] != "UNKNOWN":
             print(Fore.GREEN + f"[OK] Source IP         : {parsed_event['source_ip']}")
         else:
-            print(Fore.RED + "[--] Source IP         : Not Found")
+            print(Fore.RED   + "[--] Source IP         : Not Found")
 
         if parsed_event["method"] != "UNKNOWN":
             print(Fore.GREEN + f"[OK] SIP Method        : {parsed_event['method']}")
         else:
-            print(Fore.RED + "[--] SIP Method        : Not Found")
+            print(Fore.RED   + "[--] SIP Method        : Not Found")
 
         if parsed_event["event"] != "OTHER":
             print(Fore.GREEN + f"[OK] Event Type        : {parsed_event['event']}")
         else:
-            print(Fore.RED + "[--] Event Type        : Unknown")
+            print(Fore.RED   + "[--] Event Type        : Unknown")
 
         if parsed_event["event"] == "FAILED_AUTH":
             print(Fore.GREEN + "[OK] Authentication    : Failed")
         elif parsed_event["event"] == "AUTH_SUCCESS":
             print(Fore.GREEN + "[OK] Authentication    : Success")
         else:
-            print(Fore.RED + "[--] Authentication    : Not Found")
+            print(Fore.RED   + "[--] Authentication    : Not Found")
 
-        if parsed_event["method"] == "REGISTER":
-            print(Fore.GREEN + "[OK] REGISTER          : Detected")
-        else:
-            print(Fore.RED + "[--] REGISTER          : Not Found")
+        print(Fore.GREEN  + "[OK] REGISTER          : Detected"
+              if parsed_event["method"] == "REGISTER"
+              else Fore.RED + "[--] REGISTER          : Not Found")
 
-        if parsed_event["method"] == "INVITE":
-            print(Fore.GREEN + "[OK] INVITE            : Detected")
-        else:
-            print(Fore.RED + "[--] INVITE            : Not Found")
+        print(Fore.GREEN  + "[OK] INVITE            : Detected"
+              if parsed_event["method"] == "INVITE"
+              else Fore.RED + "[--] INVITE            : Not Found")
 
-        if parsed_event["method"] == "OPTIONS":
-            print(Fore.GREEN + "[OK] OPTIONS           : Detected")
-        else:
-            print(Fore.RED + "[--] OPTIONS           : Not Found")
+        print(Fore.GREEN  + "[OK] OPTIONS           : Detected"
+              if parsed_event["method"] == "OPTIONS"
+              else Fore.RED + "[--] OPTIONS           : Not Found")
 
         if parsed_event["module"] != "UNKNOWN":
             print(Fore.YELLOW + f"[i]  Module            : {parsed_event['module']}")
 
         print(Fore.CYAN + "============================================================")
 
-        # --------------------------------------------------
-        # IP Geolocation — show where the IP is coming from
-        # --------------------------------------------------
+        # Geolocation
         src_ip = parsed_event["source_ip"]
         if src_ip and src_ip != "UNKNOWN":
             print(Fore.MAGENTA + "\n============================================================")
@@ -153,9 +182,7 @@ class LogMonitor(FileSystemEventHandler):
             print(Fore.MAGENTA + format_ip_info(geo))
             print(Fore.MAGENTA + "============================================================")
 
-        # --------------------------------------------------
-        # Toll Fraud destination country
-        # --------------------------------------------------
+        # Toll Fraud destination
         destination = parsed_event.get("destination")
         if destination and parsed_event["event"] == "TOLL_FRAUD":
             country, prefix = lookup_phone_country(destination)
@@ -171,78 +198,109 @@ class LogMonitor(FileSystemEventHandler):
 
         if attack:
             self.firewall.process_attack(attack)
-
         else:
+            self._display_firewall_status(parsed_event)
 
-            print(Fore.YELLOW + "\n============================================================")
-            print(Fore.YELLOW + "FIREWALL ANALYSIS")
-            print(Fore.YELLOW + "============================================================")
+    # ----------------------------------------------------------
+    # Firewall Status Display (no attack)
+    # ----------------------------------------------------------
 
-            event_type = parsed_event["event"]
-            module     = parsed_event["module"]
+    def _display_firewall_status(self, parsed_event):
 
-            print(Fore.YELLOW + "Status          : Ignored")
+        event_type = parsed_event.get("event", "OTHER")
+        module     = parsed_event.get("module", "UNKNOWN")
 
-            if event_type in STATIC_NON_ATTACK_REASONS:
-                print(Fore.YELLOW + f"Reason          : {STATIC_NON_ATTACK_REASONS[event_type]}")
-                print(Fore.YELLOW + f"Event Type      : {event_type}")
+        status = STATUS_LABELS.get(event_type, "Allowed")
+        action = ACTION_LABELS.get(event_type, "Monitoring")
+        reason = REASON_LABELS.get(event_type, "")
 
-            elif event_type in DYNAMIC_MODULE_EVENTS:
-                print(Fore.YELLOW + "Reason          : Internal Asterisk log, not a security event")
-                print(Fore.YELLOW + f"Module          : {module}")
-                print(Fore.YELLOW + f"Event Type      : {event_type}")
+        print(Fore.YELLOW + "\n============================================================")
+        print(Fore.YELLOW + "FIREWALL ANALYSIS")
+        print(Fore.YELLOW + "============================================================")
+        print(Fore.YELLOW + f"Status          : {status}")
 
-            elif event_type == "OTHER":
-                print(Fore.YELLOW + "Reason          : Unsupported or Unknown Log")
-                print(Fore.YELLOW + f"Module          : {module}")
+        if reason:
+            print(Fore.YELLOW + f"Reason          : {reason}")
+        elif event_type in DYNAMIC_MODULE_EVENTS:
+            print(Fore.YELLOW + f"Reason          : Internal Asterisk module log")
+            print(Fore.YELLOW + f"Module          : {module}")
+        else:
+            print(Fore.YELLOW + f"Reason          : Event tracked, below block threshold")
 
+        print(Fore.YELLOW + f"Event Type      : {event_type}")
+        print(Fore.YELLOW + "Threat Level    : None")
+        print(Fore.YELLOW + f"Firewall Action : {action}")
+        print(Fore.YELLOW + "============================================================")
+
+    # ----------------------------------------------------------
+    # Shared line buffer — assembles multi-line SIP blocks
+    # ----------------------------------------------------------
+
+    def _handle_line(self, line):
+
+        is_marker = SIP_BLOCK_MARKER in line and (
+            "Transmitting SIP" in line or "Received SIP" in line
+        )
+
+        if self._in_sip_block:
+            if is_new_log_entry(line):
+                full_block = "".join(self._sip_block_lines)
+                self._in_sip_block    = False
+                self._sip_block_lines = []
+                self.process_entry(full_block)
             else:
-                print(Fore.YELLOW + "Reason          : Recognized event, below attack threshold")
-                print(Fore.YELLOW + f"Event Type      : {event_type}")
+                self._sip_block_lines.append(line)
+                return
 
-            print(Fore.YELLOW + "Threat Level    : None")
-            print(Fore.YELLOW + "Firewall Action : No Action")
-            print(Fore.YELLOW + "Monitoring      : Continue")
-            print(Fore.YELLOW + "============================================================")
-
-    def on_modified(self, event):
-
-        if event.src_path != ASTERISK_LOG:
+        if is_marker:
+            self._in_sip_block    = True
+            self._sip_block_lines = [line]
             return
 
+        if not line.strip():
+            return
+
+        self.process_entry(line)
+
+
+# ===========================================================
+# MODE 1 — FILE WATCHER
+# ===========================================================
+
+class LogMonitor(BaseMonitor, FileSystemEventHandler):
+
+    def __init__(self):
+        super().__init__()
+        self._init_components()
+
+        try:
+            self.file = open(ASTERISK_LOG, "r", encoding="utf-8", errors="replace")
+        except FileNotFoundError:
+            print(Fore.RED + f"[ERROR] Log file not found: {ASTERISK_LOG}")
+            raise SystemExit(1)
+
+        self.file.seek(0, os.SEEK_END)
+
+    def __del__(self):
+        try:
+            if self.file and not self.file.closed:
+                self.file.close()
+        except AttributeError:
+            pass
+
+    def on_modified(self, event):
+        if event.src_path != ASTERISK_LOG:
+            return
         while True:
-
             line = self.file.readline()
-
             if not line:
                 break
+            self._handle_line(line)
 
-            is_marker_line = SIP_BLOCK_MARKER in line and (
-                "Transmitting SIP" in line or "Received SIP" in line
-            )
 
-            if self._in_sip_block:
-
-                if is_new_log_entry(line):
-                    full_block = "".join(self._sip_block_lines)
-                    self._in_sip_block    = False
-                    self._sip_block_lines = []
-                    self.process_entry(full_block)
-
-                else:
-                    self._sip_block_lines.append(line)
-                    continue
-
-            if is_marker_line:
-                self._in_sip_block    = True
-                self._sip_block_lines = [line]
-                continue
-
-            if not line.strip():
-                continue
-
-            self.process_entry(line)
-
+# ===========================================================
+# MAIN
+# ===========================================================
 
 def main():
 
@@ -250,26 +308,69 @@ def main():
     print("LIVE ASTERISK FIREWALL")
     print("=" * 60)
     print()
-    print("Watching")
-    print(ASTERISK_LOG)
-    print()
 
-    observer = Observer()
-    observer.schedule(
-        LogMonitor(),
-        path=os.path.dirname(ASTERISK_LOG) or ".",
-        recursive=False
-    )
-    observer.start()
+    # --------------------------------------------------
+    # AMI MODE
+    # --------------------------------------------------
+    if USE_AMI:
 
-    try:
-        while True:
-            time.sleep(1)
+        from ami_monitor import AMIMonitor
 
-    except KeyboardInterrupt:
-        observer.stop()
+        print(Fore.CYAN + "Mode      : AMI DIRECT CONNECTION")
+        print(Fore.CYAN + f"Host      : {AMI_HOST}:{AMI_PORT}")
+        print(Fore.CYAN + f"Username  : {AMI_USERNAME}")
+        print()
 
-    observer.join()
+        monitor = AMIMonitor(
+            host     = AMI_HOST,
+            port     = AMI_PORT,
+            username = AMI_USERNAME,
+            secret   = AMI_SECRET,
+        )
+        monitor.start()
+
+    # --------------------------------------------------
+    # PACKET SNIFFER MODE
+    # --------------------------------------------------
+    elif USE_SNIFFER:
+
+        from packet_sniffer import SIPPacketSniffer
+
+        print(Fore.CYAN + "Mode      : PACKET SNIFFER")
+        print(Fore.CYAN + f"Interface : {SNIFF_INTERFACE}")
+        print(Fore.CYAN + f"Port      : {SNIFF_PORT}")
+        print()
+
+        sniffer = SIPPacketSniffer(
+            interface = SNIFF_INTERFACE,
+            port      = SNIFF_PORT,
+        )
+        sniffer.run()
+
+    # --------------------------------------------------
+    # FILE WATCHER MODE (default)
+    # --------------------------------------------------
+    else:
+
+        print(Fore.GREEN + "Mode      : FILE WATCHER")
+        print(Fore.GREEN + f"Watching  : {ASTERISK_LOG}")
+        print()
+
+        observer = Observer()
+        observer.schedule(
+            LogMonitor(),
+            path      = os.path.dirname(ASTERISK_LOG) or ".",
+            recursive = False,
+        )
+        observer.start()
+
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            observer.stop()
+
+        observer.join()
 
 
 if __name__ == "__main__":
