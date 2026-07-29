@@ -9,16 +9,11 @@ Purpose:
     Receives real-time security and call events
     without needing log files or PJSIP logger.
 
-AMI Setup in /etc/asterisk/manager.conf:
-    [general]
-    enabled  = yes
-    port     = 5038
-    bindaddr = 127.0.0.1
-
-    [firewall]
-    secret = yourpassword
+AMI Setup in /etc/asterisk/manager.d/pbxshield.conf:
+    [pbxshield]
+    secret = internalp@ss567
     read   = security,call,log,verbose
-    write  = system
+    write  =
 
 Then reload:
     sudo asterisk -rx "manager reload"
@@ -43,23 +38,23 @@ init(autoreset=True)
 # ----------------------------------------------------------
 
 AMI_SECURITY_EVENT_MAP = {
-    "ChallengeSent":        "AUTH_CHALLENGE",
-    "SuccessfulAuth":       "AUTH_SUCCESS",
-    "InvalidPassword":      "FAILED_AUTH",
-    "InvalidAccountID":     "UNKNOWN_ENDPOINT",
-    "ChallengeResponseFailed": "FAILED_AUTH",
-    "MemoryLimitReached":   "SYSTEM_LOG",
-    "LoadAverageLimit":     "SYSTEM_LOG",
-    "RequestNotSupported":  "SYSTEM_LOG",
-    "SessionLimit":         "SYSTEM_LOG",
-    "ACL":                  "ACL_BLOCKED",
-    "RequestNotAllowed":    "ACL_BLOCKED",
-    "AuthMethodNotAllowed": "FAILED_AUTH",
-    "TollFraud":            "TOLL_FRAUD",
+    "ChallengeSent":             "AUTH_CHALLENGE",
+    "SuccessfulAuth":            "AUTH_SUCCESS",
+    "InvalidPassword":           "FAILED_AUTH",
+    "InvalidAccountID":          "UNKNOWN_ENDPOINT",
+    "ChallengeResponseFailed":   "FAILED_AUTH",
+    "MemoryLimitReached":        "SYSTEM_LOG",
+    "LoadAverageLimit":          "SYSTEM_LOG",
+    "RequestNotSupported":       "SYSTEM_LOG",
+    "SessionLimit":              "SYSTEM_LOG",
+    "ACL":                       "ACL_BLOCKED",
+    "RequestNotAllowed":         "ACL_BLOCKED",
+    "AuthMethodNotAllowed":      "FAILED_AUTH",
+    "TollFraud":                 "TOLL_FRAUD",
 }
 
 # ----------------------------------------------------------
-# AMI Event → SIP Method mapping
+# AMI Channel Event → SIP Method mapping
 # ----------------------------------------------------------
 
 AMI_CHANNEL_METHOD_MAP = {
@@ -68,10 +63,17 @@ AMI_CHANNEL_METHOD_MAP = {
     "Registry":   "REGISTER",
 }
 
-# Status/action labels
+# ----------------------------------------------------------
+# Status / Action labels for non-attack events
+# ----------------------------------------------------------
+
 STATUS_LABELS = {
     "AUTH_CHALLENGE":   "Informational",
     "AUTH_SUCCESS":     "Allowed",
+    "FAILED_AUTH":      "Warning",
+    "UNKNOWN_ENDPOINT": "Warning",
+    "ACL_BLOCKED":      "Warning",
+    "TOLL_FRAUD":       "Critical",
     "REGISTER":         "Allowed",
     "INVITE":           "Allowed",
     "OPTIONS":          "Allowed",
@@ -80,9 +82,13 @@ STATUS_LABELS = {
     "OTHER":            "Allowed",
 }
 
-FIREWALL_ACTION_LABELS = {
+ACTION_LABELS = {
     "AUTH_CHALLENGE":   "Monitoring",
     "AUTH_SUCCESS":     "Monitoring",
+    "FAILED_AUTH":      "Tracking",
+    "UNKNOWN_ENDPOINT": "Tracking",
+    "ACL_BLOCKED":      "Tracking",
+    "TOLL_FRAUD":       "Tracking",
     "REGISTER":         "Monitoring",
     "INVITE":           "Monitoring",
     "OPTIONS":          "Monitoring",
@@ -91,9 +97,37 @@ FIREWALL_ACTION_LABELS = {
     "OTHER":            "Monitoring",
 }
 
+REASON_LABELS = {
+    "AUTH_CHALLENGE":   "Authentication challenge — normal SIP handshake",
+    "AUTH_SUCCESS":     "Successful authentication — call permitted",
+    "FAILED_AUTH":      "Failed authentication — tracking for brute force",
+    "UNKNOWN_ENDPOINT": "Unknown SIP account — possible scanning",
+    "ACL_BLOCKED":      "ACL violation — tracking for block",
+    "TOLL_FRAUD":       "Suspicious outbound call — tracking for toll fraud",
+    "INVITE":           "Call INVITE tracked — below flood threshold",
+    "REGISTER":         "REGISTER tracked — below flood threshold",
+    "OPTIONS":          "OPTIONS tracked — below flood threshold",
+    "BYE":              "Call ended normally",
+    "OTHER":            "Event tracked and monitored",
+}
+
+# Private IP prefixes — skip geolocation for these
+PRIVATE_PREFIXES = (
+    "127.", "10.", "192.168.",
+    "172.16.", "172.17.", "172.18.", "172.19.",
+    "172.20.", "172.21.", "172.22.", "172.23.",
+    "172.24.", "172.25.", "172.26.", "172.27.",
+    "172.28.", "172.29.", "172.30.", "172.31.",
+    "0.0.0.0",
+)
+
+
+def is_private(ip):
+    return not ip or ip.startswith(PRIVATE_PREFIXES)
+
 
 # ===========================================================
-# AMI Client — raw TCP socket connection to Asterisk
+# AMI CLIENT — raw TCP socket connection to Asterisk
 # ===========================================================
 
 class AMIClient:
@@ -111,26 +145,47 @@ class AMIClient:
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.sock.settimeout(10)
         self.sock.connect((self.host, self.port))
-        self.sock.settimeout(None)
 
-        # Read AMI banner
-        banner = self._read_message()
-        print(Fore.CYAN + f"[AMI] Connected  : {banner.strip()}")
+        # ── Read banner as ONE line ──
+        # Asterisk banner = "Asterisk Call Manager/9.0.0\r\n"
+        # It has NO double newline after it — read until first \n only
+        banner = b""
+        while b"\n" not in banner:
+            chunk = self.sock.recv(256)
+            if not chunk:
+                break
+            banner += chunk
 
-        # Send login
+        print(Fore.CYAN + f"[AMI] Connected  : {banner.decode(errors='replace').strip()}")
+
+        # ── Send login action ──
         self._send({
             "Action":   "Login",
             "Username": self.username,
             "Secret":   self.secret,
         })
 
-        response = self._read_message()
+        # ── Read login response (blank line terminated) ──
+        response = b""
+        self.sock.settimeout(5)
+        try:
+            while b"\r\n\r\n" not in response and b"\n\n" not in response:
+                chunk = self.sock.recv(4096)
+                if not chunk:
+                    break
+                response += chunk
+        except socket.timeout:
+            pass
 
-        if "Success" in response:
+        self.sock.settimeout(None)
+
+        response_str = response.decode("utf-8", errors="replace")
+
+        if "Success" in response_str:
             print(Fore.GREEN + "[AMI] Login      : Success")
             return True
         else:
-            print(Fore.RED + f"[AMI] Login failed: {response}")
+            print(Fore.RED + f"[AMI] Login failed: {response_str[:300]}")
             return False
 
     def _send(self, action_dict):
@@ -142,21 +197,22 @@ class AMIClient:
         self.sock.sendall(msg.encode("utf-8"))
 
     def _read_message(self):
-        """
-        Read one AMI message (ends with blank line).
-        """
+        """Read one complete AMI message (blank line terminated)."""
         data = b""
         while b"\r\n\r\n" not in data and b"\n\n" not in data:
-            chunk = self.sock.recv(4096)
-            if not chunk:
+            try:
+                chunk = self.sock.recv(4096)
+                if not chunk:
+                    break
+                data += chunk
+            except Exception:
                 break
-            data += chunk
         return data.decode("utf-8", errors="replace")
 
     def listen(self, callback):
         """
-        Continuously read AMI events and call callback(event_dict)
-        for each complete event received.
+        Continuously read AMI events and call
+        callback(event_dict) for each complete event.
         """
         buffer = ""
 
@@ -169,7 +225,7 @@ class AMIClient:
 
                 buffer += chunk
 
-                # AMI events are separated by \r\n\r\n
+                # AMI events separated by \r\n\r\n
                 while "\r\n\r\n" in buffer:
                     raw, buffer = buffer.split("\r\n\r\n", 1)
                     event = self._parse(raw)
@@ -185,7 +241,7 @@ class AMIClient:
 
     @staticmethod
     def _parse(raw):
-        """Parse a raw AMI event string into a dict."""
+        """Parse raw AMI event string into a dict."""
         event = {}
         for line in raw.strip().split("\r\n"):
             if ": " in line:
@@ -202,7 +258,7 @@ class AMIClient:
 
 
 # ===========================================================
-# AMI Monitor — processes events and feeds detector/firewall
+# AMI MONITOR — processes events → detector → firewall
 # ===========================================================
 
 class AMIMonitor:
@@ -213,7 +269,7 @@ class AMIMonitor:
         self.firewall = Firewall()
 
     def start(self):
-        """Connect to AMI and start listening."""
+        """Connect to AMI and start listening for events."""
 
         connected = False
         while not connected:
@@ -237,7 +293,7 @@ class AMIMonitor:
             self.client.close()
 
     # ----------------------------------------------------------
-    # Handle each AMI event
+    # Route each AMI event to the correct handler
     # ----------------------------------------------------------
 
     def handle_event(self, ami_event):
@@ -247,15 +303,11 @@ class AMIMonitor:
         if not event_name:
             return
 
-        # --------------------------------------------------
-        # Security Events (from res_security_log)
-        # --------------------------------------------------
+        # Security events
         if event_name == "SecurityEvent":
             self._handle_security_event(ami_event)
 
-        # --------------------------------------------------
-        # Call Events
-        # --------------------------------------------------
+        # Call channel events
         elif event_name in AMI_CHANNEL_METHOD_MAP:
             self._handle_channel_event(ami_event, event_name)
 
@@ -268,29 +320,26 @@ class AMIMonitor:
         sub_event  = ami_event.get("SubEvent", "")
         event_type = AMI_SECURITY_EVENT_MAP.get(sub_event, "OTHER")
 
-        # Extract IP from RemoteAddress field
-        # Format: "IPV4/UDP/185.22.11.5/5060"
+        # Extract IP from RemoteAddress: IPV4/UDP/185.22.11.5/5060
         remote_addr = ami_event.get("RemoteAddress", "")
-        src_ip      = self._extract_ip(remote_addr)
+        src_ip      = self._extract_ip(remote_addr) or "UNKNOWN"
 
-        account_id = ami_event.get("AccountID", "")
-        severity   = ami_event.get("Severity", "")
-        service    = ami_event.get("Service", "")
+        account_id  = ami_event.get("AccountID", "")
+        service     = ami_event.get("Service", "")
 
         parsed_event = {
-            "timestamp":  datetime.now().isoformat(),
-            "source_ip":  src_ip or "UNKNOWN",
-            "method":     "UNKNOWN",
-            "event":      event_type,
-            "module":     "AMI",
-            "account_id": account_id,
-            "service":    service,
+            "timestamp":   datetime.now().isoformat(),
+            "source_ip":   src_ip,
+            "method":      "UNKNOWN",
+            "event":       event_type,
+            "module":      "AMI",
+            "account_id":  account_id,
+            "service":     service,
             "destination": None,
         }
 
-        self._display_event(ami_event, parsed_event, sub_event)
+        self._display_security_event(ami_event, parsed_event, sub_event)
 
-        # Run through detector + firewall
         attack = self.detector.detect(parsed_event)
         if attack:
             self.firewall.process_attack(attack)
@@ -298,7 +347,7 @@ class AMIMonitor:
             self._display_firewall_status(parsed_event)
 
     # ----------------------------------------------------------
-    # Channel Event Handler (INVITE / BYE / REGISTER)
+    # Channel Event Handler (calls / registrations)
     # ----------------------------------------------------------
 
     def _handle_channel_event(self, ami_event, event_name):
@@ -306,20 +355,17 @@ class AMIMonitor:
         method    = AMI_CHANNEL_METHOD_MAP.get(event_name, "UNKNOWN")
         caller_id = ami_event.get("CallerIDNum", "")
         channel   = ami_event.get("Channel", "")
-        context   = ami_event.get("Context", "")
         exten     = ami_event.get("Exten", "")
 
-        # Try to extract IP from channel name
-        # e.g. "PJSIP/185.22.11.5-0000001"
-        src_ip = self._extract_ip_from_channel(channel)
+        src_ip = self._extract_ip_from_channel(channel) or "UNKNOWN"
 
         parsed_event = {
-            "timestamp":  datetime.now().isoformat(),
-            "source_ip":  src_ip or "UNKNOWN",
-            "method":     method,
-            "event":      method,
-            "module":     "AMI",
-            "caller_id":  caller_id,
+            "timestamp":   datetime.now().isoformat(),
+            "source_ip":   src_ip,
+            "method":      method,
+            "event":       method,
+            "module":      "AMI",
+            "caller_id":   caller_id,
             "destination": exten or None,
         }
 
@@ -335,14 +381,14 @@ class AMIMonitor:
     # Display — Security Event
     # ----------------------------------------------------------
 
-    def _display_event(self, ami_raw, parsed, sub_event):
+    def _display_security_event(self, ami_raw, parsed, sub_event):
 
         src_ip = parsed["source_ip"]
 
         print(Fore.GREEN + "\n============================================================")
-        print(Fore.GREEN + "AMI EVENT RECEIVED")
+        print(Fore.GREEN + "AMI SECURITY EVENT")
         print(Fore.GREEN + "============================================================")
-        print(Fore.GREEN + f"  SecurityEvent : {sub_event}")
+        print(Fore.GREEN + f"  SubEvent : {sub_event}")
 
         print(Fore.CYAN + "\n============================================================")
         print(Fore.CYAN + "AMI SECURITY ANALYSIS")
@@ -362,16 +408,14 @@ class AMIMonitor:
         if parsed.get("service"):
             print(Fore.GREEN + f"[OK]  Service      : {parsed['service']}")
 
-        # AMI raw fields
         for field in ["Severity", "LocalAddress", "RemoteAddress", "Challenge", "UsingPassword"]:
             val = ami_raw.get(field)
             if val:
-                print(Fore.YELLOW + f"[i]   {field:<16}: {val}")
+                print(Fore.YELLOW + f"[i]   {field:<18}: {val}")
 
         print(Fore.CYAN + "============================================================")
 
-        # Geolocation
-        if src_ip and src_ip != "UNKNOWN":
+        if not is_private(src_ip) and src_ip != "UNKNOWN":
             self._display_geo(src_ip)
 
     # ----------------------------------------------------------
@@ -383,7 +427,7 @@ class AMIMonitor:
         src_ip = parsed["source_ip"]
 
         print(Fore.GREEN + "\n============================================================")
-        print(Fore.GREEN + f"AMI CALL EVENT [{event_name}]")
+        print(Fore.GREEN + f"AMI CALL EVENT  [{event_name}]")
         print(Fore.GREEN + "============================================================")
 
         print(Fore.CYAN + "\n============================================================")
@@ -401,37 +445,30 @@ class AMIMonitor:
         for field in ["Channel", "Context", "Exten", "Priority", "Cause-txt"]:
             val = ami_raw.get(field)
             if val:
-                print(Fore.YELLOW + f"[i]   {field:<16}: {val}")
+                print(Fore.YELLOW + f"[i]   {field:<18}: {val}")
 
         print(Fore.CYAN + "============================================================")
 
-        if src_ip and src_ip != "UNKNOWN":
+        if not is_private(src_ip) and src_ip != "UNKNOWN":
             self._display_geo(src_ip)
 
     # ----------------------------------------------------------
-    # Display — Firewall Status (no attack)
+    # Firewall Status Display (no attack detected)
     # ----------------------------------------------------------
 
     def _display_firewall_status(self, parsed_event):
 
         event_type = parsed_event.get("event", "OTHER")
-        status     = STATUS_LABELS.get(event_type, "Allowed")
-        action     = FIREWALL_ACTION_LABELS.get(event_type, "Monitoring")
 
-        reason_map = {
-            "AUTH_CHALLENGE": "Authentication challenge sent — normal SIP handshake",
-            "AUTH_SUCCESS":   "Successful authentication — call allowed",
-            "FAILED_AUTH":    "Failed auth tracked — below block threshold",
-            "INVITE":         "Call INVITE tracked — below flood threshold",
-            "REGISTER":       "REGISTER tracked — below flood threshold",
-            "OPTIONS":        "OPTIONS tracked — below flood threshold",
-        }
+        status = STATUS_LABELS.get(event_type, "Allowed")
+        action = ACTION_LABELS.get(event_type, "Monitoring")
+        reason = REASON_LABELS.get(event_type, "Event tracked and monitored")
 
         print(Fore.YELLOW + "\n============================================================")
         print(Fore.YELLOW + "FIREWALL ANALYSIS")
         print(Fore.YELLOW + "============================================================")
         print(Fore.YELLOW + f"Status          : {status}")
-        print(Fore.YELLOW + f"Reason          : {reason_map.get(event_type, 'Event tracked and monitored')}")
+        print(Fore.YELLOW + f"Reason          : {reason}")
         print(Fore.YELLOW + f"Event Type      : {event_type}")
         print(Fore.YELLOW + "Threat Level    : None")
         print(Fore.YELLOW + f"Firewall Action : {action}")
@@ -442,10 +479,6 @@ class AMIMonitor:
     # ----------------------------------------------------------
 
     def _display_geo(self, src_ip):
-
-        private = ("127.", "10.", "192.168.", "172.16.", "0.0.0.0")
-        if src_ip.startswith(private):
-            return
 
         print(Fore.MAGENTA + "\n============================================================")
         print(Fore.MAGENTA + "IP GEOLOCATION")
@@ -476,7 +509,7 @@ class AMIMonitor:
     def _extract_ip_from_channel(channel):
         """
         Try to extract IP from channel name.
-        e.g. PJSIP/185.22.11.5-00000001 → 185.22.11.5
+        e.g. PJSIP/185.22.11.5-00000001
         """
         if not channel:
             return None
