@@ -26,8 +26,8 @@ USE_SNIFFER = False
 # --------------------------------------------------
 AMI_HOST     = "127.0.0.1"
 AMI_PORT     = 5038
-AMI_USERNAME = "firewall"
-AMI_SECRET   = "yourpassword"
+AMI_USERNAME = "pbxshield"
+AMI_SECRET   = "internalp@ss567"
 
 # --------------------------------------------------
 # Packet Sniffer Settings
