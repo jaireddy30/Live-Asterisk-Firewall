@@ -138,6 +138,13 @@ class AMIClient:
         self.username = username
         self.secret   = secret
         self.sock     = None
+        self.buffer   = ""       # persistent recv buffer, shared between
+                                 # listen() and send_action_get_response()
+        self._action_id_counter = 0
+
+    def _next_action_id(self):
+        self._action_id_counter += 1
+        return f"pbxshield-{self._action_id_counter}"
 
     def connect(self):
         """Connect and log in to Asterisk AMI."""
@@ -209,28 +216,35 @@ class AMIClient:
                 break
         return data.decode("utf-8", errors="replace")
 
+    def _pop_message(self):
+        """Pop one complete \\r\\n\\r\\n-terminated message off self.buffer, if any."""
+        if "\r\n\r\n" in self.buffer:
+            raw, self.buffer = self.buffer.split("\r\n\r\n", 1)
+            return raw
+        return None
+
+    def _read_more(self):
+        """Blocking read of whatever is available into self.buffer."""
+        chunk = self.sock.recv(4096).decode("utf-8", errors="replace")
+        if not chunk:
+            raise ConnectionError("AMI connection closed by Asterisk.")
+        self.buffer += chunk
+
     def listen(self, callback):
         """
         Continuously read AMI events and call
         callback(event_dict) for each complete event.
         """
-        buffer = ""
-
         while True:
             try:
-                chunk = self.sock.recv(4096).decode("utf-8", errors="replace")
-                if not chunk:
-                    print(Fore.RED + "[AMI] Connection closed by Asterisk.")
-                    break
+                raw = self._pop_message()
+                if raw is None:
+                    self._read_more()
+                    continue
 
-                buffer += chunk
-
-                # AMI events separated by \r\n\r\n
-                while "\r\n\r\n" in buffer:
-                    raw, buffer = buffer.split("\r\n\r\n", 1)
-                    event = self._parse(raw)
-                    if event:
-                        callback(event)
+                event = self._parse(raw)
+                if event:
+                    callback(event)
 
             except KeyboardInterrupt:
                 break
@@ -238,6 +252,52 @@ class AMIClient:
             except Exception as e:
                 print(Fore.RED + f"[AMI] Error: {e}")
                 break
+
+    def send_action_get_response(self, action_dict, callback=None, timeout=3):
+        """
+        Send an AMI action tagged with a unique ActionID and block until
+        the matching response arrives (or timeout). Any other complete
+        messages that show up on the wire in the meantime (i.e. normal
+        async events interleaved with our response) are handed off to
+        `callback` so nothing gets silently dropped.
+        """
+        action_id = self._next_action_id()
+        action_dict = dict(action_dict)
+        action_dict["ActionID"] = action_id
+        self._send(action_dict)
+
+        self.sock.settimeout(timeout)
+        deadline = time.time() + timeout
+
+        try:
+            while time.time() < deadline:
+                raw = self._pop_message()
+                if raw is None:
+                    try:
+                        self._read_more()
+                    except socket.timeout:
+                        break
+                    continue
+
+                parsed = self._parse(raw)
+                if not parsed:
+                    continue
+
+                if parsed.get("ActionID") == action_id:
+                    return parsed
+
+                # Not our response — it's a real-time event that arrived
+                # while we were waiting. Forward it so it still gets
+                # processed/displayed instead of being swallowed.
+                if callback:
+                    callback(parsed)
+
+        except socket.timeout:
+            pass
+        finally:
+            self.sock.settimeout(None)
+
+        return None
 
     @staticmethod
     def _parse(raw):
@@ -267,6 +327,9 @@ class AMIMonitor:
         self.client   = AMIClient(host, port, username, secret)
         self.detector = Detector()
         self.firewall = Firewall()
+        self._ip_cache = {}   # Uniqueid -> source IP, so Hangup can reuse
+                               # the IP captured at Newchannel time (the
+                               # channel/peer may already be gone by Hangup)
 
     def start(self):
         """Connect to AMI and start listening for events."""
@@ -356,8 +419,9 @@ class AMIMonitor:
         caller_id = ami_event.get("CallerIDNum", "")
         channel   = ami_event.get("Channel", "")
         exten     = ami_event.get("Exten", "")
+        uniqueid  = ami_event.get("Uniqueid", "")
 
-        src_ip = self._extract_ip_from_channel(channel) or "UNKNOWN"
+        src_ip = self._get_remote_ip(channel, uniqueid)
 
         parsed_event = {
             "timestamp":   datetime.now().isoformat(),
@@ -510,6 +574,10 @@ class AMIMonitor:
         """
         Try to extract IP from channel name.
         e.g. PJSIP/185.22.11.5-00000001
+        NOTE: this only ever matches on legacy chan_sip-style channel
+        names. Modern PJSIP channels are named after the endpoint
+        (e.g. PJSIP/myendpoint-00000001) and never contain an IP, which
+        is why this alone was returning UNKNOWN for Newchannel/Hangup.
         """
         if not channel:
             return None
@@ -518,3 +586,47 @@ class AMIMonitor:
         if match:
             return match.group(1)
         return None
+
+    def _get_remote_ip(self, channel, uniqueid):
+        """
+        Resolve the real source IP for a call channel.
+
+        Newchannel/Hangup AMI events don't carry the remote IP directly —
+        PJSIP channel names only contain the endpoint name, not an
+        address. So we:
+          1. Check the cache (keyed by Uniqueid) first — cheap, and the
+             only option left by the time Hangup fires, since the
+             channel/peer info may no longer be queryable.
+          2. Fall back to the legacy regex, in case chan_sip is in use.
+          3. Otherwise, actively ask Asterisk via an AMI GetVar action
+             for CHANNEL(pjsip,remote_address), which returns "ip:port".
+        """
+
+        if uniqueid and uniqueid in self._ip_cache:
+            return self._ip_cache[uniqueid]
+
+        ip = self._extract_ip_from_channel(channel)
+
+        if not ip and channel:
+            try:
+                resp = self.client.send_action_get_response(
+                    {
+                        "Action":   "Getvar",
+                        "Channel":  channel,
+                        "Variable": "CHANNEL(pjsip,remote_address)",
+                    },
+                    callback=self.handle_event,
+                )
+                if resp:
+                    value = resp.get("Value", "")
+                    if value and value != "0":
+                        ip = value.split(":")[0]
+            except Exception as e:
+                print(Fore.RED + f"[AMI] GetVar lookup failed: {e}")
+
+        ip = ip or "UNKNOWN"
+
+        if uniqueid:
+            self._ip_cache[uniqueid] = ip
+
+        return ip
