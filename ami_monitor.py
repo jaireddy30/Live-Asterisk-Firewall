@@ -26,9 +26,10 @@ import time
 from datetime import datetime
 from colorama import Fore, init
 
-from detector import Detector
-from firewall import Firewall
-from ip_lookup import lookup_ip, format_ip_info, lookup_phone_country
+from detector      import Detector
+from firewall      import Firewall
+from ip_lookup     import lookup_ip, format_ip_info, lookup_phone_country
+from threat_engine import ThreatEngine
 
 init(autoreset=True)
 
@@ -64,7 +65,39 @@ AMI_CHANNEL_METHOD_MAP = {
 }
 
 # ----------------------------------------------------------
-# Status / Action labels for non-attack events
+# Call direction detection — based on AMI Context field
+# ----------------------------------------------------------
+
+INBOUND_CONTEXT_KEYWORDS = (
+    "from-plivo", "from-trunk", "from-sip", "from-provider",
+    "from-did",   "inbound",    "inbound-did", "from-pstn",
+    "from-voip",  "incoming",   "from-carrier",
+)
+
+OUTBOUND_CONTEXT_KEYWORDS = (
+    "from-internal", "outbound", "out-", "egress",
+)
+
+# ----------------------------------------------------------
+# Premium-rate / high-risk international prefixes
+# ----------------------------------------------------------
+HIGH_RISK_PREFIXES = (
+    "900", "976",
+    "44843", "44844", "44845",
+    "357900", "357976",
+    "37230", "37270",
+    "37260",
+    "42190",
+    "36900",
+    "963",
+    "964",
+    "967",
+    "218",
+    "249",
+)
+
+# ----------------------------------------------------------
+# Status / Action / Reason labels for non-attack events
 # ----------------------------------------------------------
 
 STATUS_LABELS = {
@@ -138,8 +171,7 @@ class AMIClient:
         self.username = username
         self.secret   = secret
         self.sock     = None
-        self.buffer   = ""       # persistent recv buffer, shared between
-                                 # listen() and send_action_get_response()
+        self.buffer   = ""
         self._action_id_counter = 0
 
     def _next_action_id(self):
@@ -153,9 +185,6 @@ class AMIClient:
         self.sock.settimeout(10)
         self.sock.connect((self.host, self.port))
 
-        # ── Read banner as ONE line ──
-        # Asterisk banner = "Asterisk Call Manager/9.0.0\r\n"
-        # It has NO double newline after it — read until first \n only
         banner = b""
         while b"\n" not in banner:
             chunk = self.sock.recv(256)
@@ -165,14 +194,12 @@ class AMIClient:
 
         print(Fore.CYAN + f"[AMI] Connected  : {banner.decode(errors='replace').strip()}")
 
-        # ── Send login action ──
         self._send({
             "Action":   "Login",
             "Username": self.username,
             "Secret":   self.secret,
         })
 
-        # ── Read login response (blank line terminated) ──
         response = b""
         self.sock.settimeout(5)
         try:
@@ -185,7 +212,6 @@ class AMIClient:
             pass
 
         self.sock.settimeout(None)
-
         response_str = response.decode("utf-8", errors="replace")
 
         if "Success" in response_str:
@@ -217,7 +243,7 @@ class AMIClient:
         return data.decode("utf-8", errors="replace")
 
     def _pop_message(self):
-        """Pop one complete \\r\\n\\r\\n-terminated message off self.buffer, if any."""
+        """Pop one complete \\r\\n\\r\\n-terminated message off self.buffer."""
         if "\r\n\r\n" in self.buffer:
             raw, self.buffer = self.buffer.split("\r\n\r\n", 1)
             return raw
@@ -256,10 +282,7 @@ class AMIClient:
     def send_action_get_response(self, action_dict, callback=None, timeout=3):
         """
         Send an AMI action tagged with a unique ActionID and block until
-        the matching response arrives (or timeout). Any other complete
-        messages that show up on the wire in the meantime (i.e. normal
-        async events interleaved with our response) are handed off to
-        `callback` so nothing gets silently dropped.
+        the matching response arrives (or timeout).
         """
         action_id = self._next_action_id()
         action_dict = dict(action_dict)
@@ -286,9 +309,6 @@ class AMIClient:
                 if parsed.get("ActionID") == action_id:
                     return parsed
 
-                # Not our response — it's a real-time event that arrived
-                # while we were waiting. Forward it so it still gets
-                # processed/displayed instead of being swallowed.
                 if callback:
                     callback(parsed)
 
@@ -324,12 +344,11 @@ class AMIClient:
 class AMIMonitor:
 
     def __init__(self, host, port, username, secret):
-        self.client   = AMIClient(host, port, username, secret)
-        self.detector = Detector()
-        self.firewall = Firewall()
-        self._ip_cache = {}   # Uniqueid -> source IP, so Hangup can reuse
-                               # the IP captured at Newchannel time (the
-                               # channel/peer may already be gone by Hangup)
+        self.client        = AMIClient(host, port, username, secret)
+        self.detector      = Detector()
+        self.firewall      = Firewall()
+        self.threat_engine = ThreatEngine()   # stateful behavioral engine
+        self._ip_cache     = {}   # Uniqueid -> source IP cache
 
     def start(self):
         """Connect to AMI and start listening for events."""
@@ -366,11 +385,9 @@ class AMIMonitor:
         if not event_name:
             return
 
-        # Security events
         if event_name == "SecurityEvent":
             self._handle_security_event(ami_event)
 
-        # Call channel events
         elif event_name in AMI_CHANNEL_METHOD_MAP:
             self._handle_channel_event(ami_event, event_name)
 
@@ -383,7 +400,6 @@ class AMIMonitor:
         sub_event  = ami_event.get("SubEvent", "")
         event_type = AMI_SECURITY_EVENT_MAP.get(sub_event, "OTHER")
 
-        # Extract IP from RemoteAddress: IPV4/UDP/185.22.11.5/5060
         remote_addr = ami_event.get("RemoteAddress", "")
         src_ip      = self._extract_ip(remote_addr) or "UNKNOWN"
 
@@ -418,10 +434,33 @@ class AMIMonitor:
         method    = AMI_CHANNEL_METHOD_MAP.get(event_name, "UNKNOWN")
         caller_id = ami_event.get("CallerIDNum", "")
         channel   = ami_event.get("Channel", "")
+        context   = ami_event.get("Context", "")
         exten     = ami_event.get("Exten", "")
         uniqueid  = ami_event.get("Uniqueid", "")
 
         src_ip = self._get_remote_ip(channel, uniqueid)
+
+        # ── Call direction ──
+        direction = self._determine_call_direction(context, channel)
+
+        # ── Source / Destination numbers ──
+        src_number = caller_id or "UNKNOWN"
+        dst_number = exten     or "UNKNOWN"
+
+        # ── Stateful threat assessment ──
+        threat = self.threat_engine.assess(
+            caller_id = caller_id,
+            exten     = exten,
+            context   = context,
+            direction = direction,
+            src_ip    = src_ip,
+            event     = method,
+            uniqueid  = uniqueid,
+        )
+
+        # ── On Hangup, release inbound state ──
+        if event_name == "Hangup" and direction == "INCOMING":
+            self.threat_engine.clear_inbound(uniqueid)
 
         parsed_event = {
             "timestamp":   datetime.now().isoformat(),
@@ -431,6 +470,10 @@ class AMIMonitor:
             "module":      "AMI",
             "caller_id":   caller_id,
             "destination": exten or None,
+            "direction":   direction,
+            "src_number":  src_number,
+            "dst_number":  dst_number,
+            "threat":      threat,
         }
 
         self._display_channel_event(ami_event, parsed_event, event_name)
@@ -488,7 +531,31 @@ class AMIMonitor:
 
     def _display_channel_event(self, ami_raw, parsed, event_name):
 
-        src_ip = parsed["source_ip"]
+        src_ip    = parsed["source_ip"]
+        direction = parsed.get("direction", "UNKNOWN")
+        threat    = parsed.get("threat", {})
+        src_num   = parsed.get("src_number", "UNKNOWN")
+        dst_num   = parsed.get("dst_number", "UNKNOWN")
+
+        # ── Direction colour coding ──
+        if direction == "INCOMING":
+            dir_color = Fore.CYAN
+            dir_arrow = "<<  INCOMING"
+        elif direction == "OUTGOING":
+            dir_color = Fore.GREEN
+            dir_arrow = ">>  OUTGOING"
+        else:
+            dir_color = Fore.WHITE
+            dir_arrow = "?   UNKNOWN"
+
+        # ── Threat colour coding ──
+        threat_level = threat.get("level", "None")
+        if threat_level in ("CRITICAL", "HIGH"):
+            thr_color = Fore.RED
+        elif threat_level in ("MEDIUM", "LOW"):
+            thr_color = Fore.YELLOW
+        else:
+            thr_color = Fore.GREEN
 
         print(Fore.GREEN + "\n============================================================")
         print(Fore.GREEN + f"AMI CALL EVENT  [{event_name}]")
@@ -497,14 +564,32 @@ class AMIMonitor:
         print(Fore.CYAN + "\n============================================================")
         print(Fore.CYAN + "CALL ANALYSIS")
         print(Fore.CYAN + "============================================================")
-        print(Fore.GREEN + f"[TIME] Timestamp   : {parsed['timestamp']}")
-        print(Fore.GREEN + f"[OK]  Event        : {event_name}")
-        print(Fore.GREEN + f"[OK]  SIP Method   : {parsed['method']}")
+        print(Fore.GREEN  + f"[TIME] Timestamp   : {parsed['timestamp']}")
+        print(Fore.GREEN  + f"[OK]  Event        : {event_name}")
+        print(Fore.GREEN  + f"[OK]  SIP Method   : {parsed['method']}")
+        print(dir_color   + f"[OK]  Caller ID    : {parsed.get('caller_id') or '<unknown>'}")
 
-        if parsed.get("caller_id"):
-            print(Fore.GREEN + f"[OK]  Caller ID    : {parsed['caller_id']}")
-        if src_ip != "UNKNOWN":
-            print(Fore.GREEN + f"[OK]  Source IP    : {src_ip}")
+        # ── Source IP (always shown) ──
+        if src_ip and src_ip != "UNKNOWN":
+            print(Fore.GREEN  + f"[OK]  Source IP    : {src_ip}")
+        else:
+            print(Fore.YELLOW + "[--]  Source IP    : Not resolvable (PJSIP endpoint — no raw IP in AMI event)")
+
+        # ── Destination IP ──
+        if direction == "OUTGOING":
+            dst_ip_label = "127.0.0.1 (PBX -> Trunk)"
+        elif direction == "INCOMING":
+            dst_ip_label = "127.0.0.1 (Trunk -> PBX)"
+        else:
+            dst_ip_label = "127.0.0.1 (PBX)"
+        print(Fore.CYAN + f"[i]   Destination IP: {dst_ip_label}")
+
+        # ── Phone numbers ──
+        print(Fore.GREEN + f"[OK]  Source Number : {src_num}")
+        print(Fore.GREEN + f"[OK]  Dest Number   : {dst_num}")
+
+        # ── Direction ──
+        print(dir_color + f"[OK]  Direction     : {dir_arrow}")
 
         for field in ["Channel", "Context", "Exten", "Priority", "Cause-txt"]:
             val = ami_raw.get(field)
@@ -517,33 +602,84 @@ class AMIMonitor:
             self._display_geo(src_ip)
 
     # ----------------------------------------------------------
-    # Firewall Status Display (no attack detected)
+    # Firewall Status Display
     # ----------------------------------------------------------
 
     def _display_firewall_status(self, parsed_event):
 
         event_type = parsed_event.get("event", "OTHER")
+        threat     = parsed_event.get("threat", {})
+        direction  = parsed_event.get("direction", None)
 
         status = STATUS_LABELS.get(event_type, "Allowed")
         action = ACTION_LABELS.get(event_type, "Monitoring")
         reason = REASON_LABELS.get(event_type, "Event tracked and monitored")
 
-        print(Fore.YELLOW + "\n============================================================")
-        print(Fore.YELLOW + "FIREWALL ANALYSIS")
-        print(Fore.YELLOW + "============================================================")
-        print(Fore.YELLOW + f"Status          : {status}")
-        print(Fore.YELLOW + f"Reason          : {reason}")
-        print(Fore.YELLOW + f"Event Type      : {event_type}")
-        print(Fore.YELLOW + "Threat Level    : None")
-        print(Fore.YELLOW + f"Firewall Action : {action}")
-        print(Fore.YELLOW + "============================================================")
+        threat_level  = threat.get("level",  "None") if threat else "None"
+        threat_reason = threat.get("reason", "")      if threat else ""
+        threat_flags  = threat.get("flags",  [])      if threat else []
+
+        if threat_level in ("HIGH", "CRITICAL"):
+            status = "WARNING — Suspicious Call"
+            action = "Alert"
+        elif threat_level == "MEDIUM":
+            status = "Caution"
+            action = "Monitoring (elevated)"
+        elif threat_level == "LOW":
+            status = "Informational"
+            action = "Monitoring"
+        else:
+            threat_reason = reason
+
+        if threat_level in ("HIGH", "CRITICAL"):
+            hdr_color = Fore.RED
+            lvl_color = Fore.RED
+        elif threat_level in ("MEDIUM", "LOW"):
+            hdr_color = Fore.YELLOW
+            lvl_color = Fore.YELLOW
+        else:
+            hdr_color = Fore.YELLOW
+            lvl_color = Fore.GREEN
+
+        if threat_level in ("HIGH", "CRITICAL"):
+            safe_label = Fore.RED    + "NOT SAFE — Suspicious activity detected"
+        elif threat_level == "MEDIUM":
+            safe_label = Fore.YELLOW + "CAUTION — Moderate risk indicators"
+        elif threat_level == "LOW":
+            safe_label = Fore.YELLOW + "LOW RISK — Minor anomaly noted"
+        else:
+            safe_label = Fore.GREEN  + "SAFE — No threats detected"
+
+        breakdown = threat.get("breakdown", {}) if threat else {}
+        score     = threat.get("score",     0)  if threat else 0
+
+        print(hdr_color + "\n============================================================")
+        print(hdr_color + "FIREWALL ANALYSIS")
+        print(hdr_color + "============================================================")
+        print(hdr_color + f"Status          : {status}")
+        print(hdr_color + f"Reason          : {threat_reason}")
+        print(hdr_color + f"Event Type      : {event_type}")
+        if direction:
+            dir_arrow = ">> OUTGOING" if direction == "OUTGOING" else ("<< INCOMING" if direction == "INCOMING" else "? UNKNOWN")
+            print(hdr_color + f"Call Direction  : {dir_arrow}")
+        print(lvl_color + f"Threat Level    : {threat_level}  (composite score: {score})")
+        print(Fore.RESET + safe_label)
+        if threat_flags:
+            print(hdr_color + "Threat Flags    :")
+            for flag in threat_flags:
+                print(hdr_color + f"  [!] {flag}")
+        if breakdown:
+            active = {k: v for k, v in breakdown.items() if v > 0}
+            if active:
+                print(hdr_color + f"Score Breakdown : " + "  ".join(f"{k}={v}" for k, v in active.items()))
+        print(hdr_color + f"Firewall Action : {action}")
+        print(hdr_color + "============================================================")
 
     # ----------------------------------------------------------
     # Geolocation display
     # ----------------------------------------------------------
 
     def _display_geo(self, src_ip):
-
         print(Fore.MAGENTA + "\n============================================================")
         print(Fore.MAGENTA + "IP GEOLOCATION")
         print(Fore.MAGENTA + "============================================================")
@@ -557,11 +693,26 @@ class AMIMonitor:
     # ----------------------------------------------------------
 
     @staticmethod
+    def _determine_call_direction(context, channel=""):
+        ctx_lower = (context or "").lower()
+        ch_lower  = (channel  or "").lower()
+
+        for kw in INBOUND_CONTEXT_KEYWORDS:
+            if kw in ctx_lower:
+                return "INCOMING"
+
+        for kw in OUTBOUND_CONTEXT_KEYWORDS:
+            if kw in ctx_lower:
+                return "OUTGOING"
+
+        if "plivo" in ch_lower or "trunk" in ch_lower or "pstn" in ch_lower:
+            return "INCOMING"
+
+        return "UNKNOWN"
+
+    @staticmethod
     def _extract_ip(remote_address):
-        """
-        Extract IP from AMI RemoteAddress field.
-        Format: IPV4/UDP/185.22.11.5/5060
-        """
+        """Extract IP from AMI RemoteAddress field: IPV4/UDP/185.22.11.5/5060"""
         if not remote_address:
             return None
         parts = remote_address.split("/")
@@ -571,14 +722,7 @@ class AMIMonitor:
 
     @staticmethod
     def _extract_ip_from_channel(channel):
-        """
-        Try to extract IP from channel name.
-        e.g. PJSIP/185.22.11.5-00000001
-        NOTE: this only ever matches on legacy chan_sip-style channel
-        names. Modern PJSIP channels are named after the endpoint
-        (e.g. PJSIP/myendpoint-00000001) and never contain an IP, which
-        is why this alone was returning UNKNOWN for Newchannel/Hangup.
-        """
+        """Try to extract IP from legacy chan_sip channel name."""
         if not channel:
             return None
         import re
@@ -588,19 +732,7 @@ class AMIMonitor:
         return None
 
     def _get_remote_ip(self, channel, uniqueid):
-        """
-        Resolve the real source IP for a call channel.
-
-        Newchannel/Hangup AMI events don't carry the remote IP directly —
-        PJSIP channel names only contain the endpoint name, not an
-        address. So we:
-          1. Check the cache (keyed by Uniqueid) first — cheap, and the
-             only option left by the time Hangup fires, since the
-             channel/peer info may no longer be queryable.
-          2. Fall back to the legacy regex, in case chan_sip is in use.
-          3. Otherwise, actively ask Asterisk via an AMI GetVar action
-             for CHANNEL(pjsip,remote_address), which returns "ip:port".
-        """
+        """Resolve the real source IP for a call channel."""
 
         if uniqueid and uniqueid in self._ip_cache:
             return self._ip_cache[uniqueid]
